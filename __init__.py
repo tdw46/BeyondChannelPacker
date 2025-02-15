@@ -275,6 +275,11 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
             output[:, :, 2] = b_data if b_data is not None else 0.0
             output[:, :, 3] = a_data if a_data is not None else 1.0
 
+        # -----------------------------------------------------------------------------
+        # Premultiply the RGB channels by the alpha channel to avoid white fringes in transparent areas.
+        # -----------------------------------------------------------------------------
+        output[:, :, :3] *= output[:, :, 3:4]
+
         # Flatten the output array to a 1D list (row‑major order) for Blender.
         flat_pixels = output.flatten()
 
