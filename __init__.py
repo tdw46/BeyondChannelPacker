@@ -79,6 +79,12 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
         description="Image providing the Alpha channel (will be flattened to one channel)",
         update=image_update_callback("alpha_image"),
     )
+    # New property to override the original RGB image with the packed image.
+    override_rgb: bpy.props.BoolProperty(
+        name="Override RGB",
+        description="Override the original RGB image with the packed image after packing",
+        default=False,
+    )
 
     # --- For MULTI mode (Separate Channels) ---
     r_image: bpy.props.PointerProperty(
@@ -297,7 +303,15 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
         )
         result_img.pixels = flat_pixels.tolist()
 
-        # Store the result and update the image editor view.
+        # -----------------------------------------------------------------------------
+        # If override is enabled in SINGLE mode, replace the original RGB image.
+        # -----------------------------------------------------------------------------
+        if mode == "SINGLE" and props.override_rgb:
+            old_name = props.rgb_image.name
+            bpy.data.images.remove(props.rgb_image, do_unlink=True)
+            result_img.name = old_name
+            props.rgb_image = result_img
+
         props.result_image = result_img
         for area in bpy.context.screen.areas:
             if area.type == "IMAGE_EDITOR":
@@ -365,6 +379,8 @@ class CHANNELPACKER_PT_panel(bpy.types.Panel):
             row.prop(props, "alpha_image")
             if props.alpha_image:
                 box.template_preview(props.alpha_image, show_buttons=False)
+            row = box.row()
+            row.prop(props, "override_rgb")
         else:
             box = layout.box()
             box.label(text="Separate Channels Mode", icon="IMAGE_DATA")
