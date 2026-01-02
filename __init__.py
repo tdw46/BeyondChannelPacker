@@ -238,8 +238,13 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
             self.report({"ERROR"}, "Could not determine image dimensions.")
             return {"CANCELLED"}
 
-        target_img = max(selected_images, key=lambda img: img.size[0] * img.size[1])
-        width, height = int(target_img.size[0]), int(target_img.size[1])
+        # If we're overriding the RGB image in SINGLE mode, prefer the RGB image's
+        # dimensions so we can safely overwrite/save it back to disk.
+        if mode == "SINGLE" and props.override_rgb and props.rgb_image is not None:
+            width, height = int(props.rgb_image.size[0]), int(props.rgb_image.size[1])
+        else:
+            target_img = max(selected_images, key=lambda img: img.size[0] * img.size[1])
+            width, height = int(target_img.size[0]), int(target_img.size[1])
 
         if width <= 0 or height <= 0:
             self.report({"ERROR"}, "Could not determine image dimensions.")
@@ -270,12 +275,6 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
         # default to 0 for colors and 1 for alpha.
         # -----------------------------------------------------------------------------
         output = np.zeros((height, width, 4), dtype=np.float32)
-
-        # -----------------------------------------------------------------------------
-        # Helper: Convert sRGB values to linear using a standard conversion formula.
-        # -----------------------------------------------------------------------------
-        def convert_srgb_to_linear(arr):
-            return np.where(arr < 0.04045, arr / 12.92, ((arr + 0.055) / 1.055) ** 2.4)
 
         scaled_cache = {}
         temp_images = []
@@ -330,9 +329,6 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
                 return None
             # For multi‑channel images, take the first channel (assuming it is grayscale or R).
             data = arr[:, :, 0]
-            # Convert color data from sRGB to linear if needed (do not convert alpha channels).
-            if not is_alpha and img.colorspace_settings.name == "sRGB":
-                data = convert_srgb_to_linear(data)
             return data
 
         # -----------------------------------------------------------------------------
@@ -348,19 +344,11 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
                 channels_rgb = arr_rgb.shape[2]
                 # Use the first three channels. If only one channel is available, duplicate it.
                 if channels_rgb >= 3:
-                    if rgb_img.colorspace_settings.name == "sRGB":
-                        output[:, :, 0] = convert_srgb_to_linear(arr_rgb[:, :, 0])
-                        output[:, :, 1] = convert_srgb_to_linear(arr_rgb[:, :, 1])
-                        output[:, :, 2] = convert_srgb_to_linear(arr_rgb[:, :, 2])
-                    else:
-                        output[:, :, 0] = arr_rgb[:, :, 0]
-                        output[:, :, 1] = arr_rgb[:, :, 1]
-                        output[:, :, 2] = arr_rgb[:, :, 2]
+                    output[:, :, 0] = arr_rgb[:, :, 0]
+                    output[:, :, 1] = arr_rgb[:, :, 1]
+                    output[:, :, 2] = arr_rgb[:, :, 2]
                 else:
-                    if rgb_img.colorspace_settings.name == "sRGB":
-                        gray = convert_srgb_to_linear(arr_rgb[:, :, 0])
-                    else:
-                        gray = arr_rgb[:, :, 0]
+                    gray = arr_rgb[:, :, 0]
                     output[:, :, 0] = gray
                     output[:, :, 1] = gray
                     output[:, :, 2] = gray
@@ -409,69 +397,65 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
                 except (ReferenceError, RuntimeError):
                     pass
 
-        # -----------------------------------------------------------------------------
-        # Premultiply the RGB channels by the alpha channel to avoid white fringes in transparent areas.
-        # -----------------------------------------------------------------------------
-        output[:, :, :3] *= output[:, :, 3:4]
-
         # Flatten the output array to a 1D list (row‑major order) for Blender.
         flat_pixels = output.flatten()
 
         # -----------------------------------------------------------------------------
-        # Create a new image in Blender to hold the packed data.
-        # float_buffer=True creates a 32‑bit float image; export options will allow
-        # you to save as 8‑bit or 16‑bit later.
-        # -----------------------------------------------------------------------------
-        result_img = bpy.data.images.new(
-            name="ChannelPacked",
-            width=width,
-            height=height,
-            alpha=True,
-            float_buffer=True,
-        )
-        result_img.pixels = flat_pixels.tolist()
-
-        # -----------------------------------------------------------------------------
-        # If override is enabled in SINGLE mode, replace the original RGB image.
+        # If override is enabled in SINGLE mode, write pixels back into the original
+        # RGB image datablock (preserves filepath/colorspace/alpha settings) and
+        # save directly to disk.
         # -----------------------------------------------------------------------------
         if mode == "SINGLE" and props.override_rgb:
-            old_img = props.rgb_image
-            if old_img is not None and old_img != result_img:
-                old_name = old_img.name
+            if props.rgb_image is None:
+                self.report({"ERROR"}, "RGB Image is required.")
+                return {"CANCELLED"}
 
-                # Free the original name so the replacement can take it.
+            rgb_img = props.rgb_image
+            rgb_img.pixels = flat_pixels.tolist()
+            props.result_image = rgb_img
+
+            # If the RGB image is file-backed and is a PNG, overwrite it on disk.
+            filepath = getattr(rgb_img, "filepath_raw", "") or ""
+            if filepath.lower().endswith(".png"):
                 try:
-                    old_img.name = f"{old_name}_BCP_OLD"
+                    rgb_img.file_format = "PNG"
                 except Exception:
                     pass
-
                 try:
-                    result_img.name = old_name
+                    rgb_img.save()
+                except Exception as e:
+                    self.report({"WARNING"}, f"Packed, but could not overwrite PNG: {e}")
+            else:
+                self.report(
+                    {"WARNING"},
+                    "Packed into the RGB image datablock, but did not auto-save (source is not a .png).",
+                )
+        else:
+            # -----------------------------------------------------------------------------
+            # Create a new image datablock for the packed result.
+            # -----------------------------------------------------------------------------
+            result_img = bpy.data.images.new(
+                name="ChannelPacked",
+                width=width,
+                height=height,
+                alpha=True,
+                float_buffer=True,
+            )
+            result_img.pixels = flat_pixels.tolist()
+            if mode == "SINGLE" and props.rgb_image is not None:
+                try:
+                    result_img.colorspace_settings.name = props.rgb_image.colorspace_settings.name
                 except Exception:
                     pass
-
-                # Remap all datablocks that referenced the original image to the
-                # replacement image before removing the old datablock.
-                remap_image_users(old_img, result_img)
-
                 try:
-                    bpy.data.images.remove(old_img, do_unlink=True)
-                except (ReferenceError, RuntimeError):
-                    pass
-
-                # If we couldn't rename earlier due to a name collision, try again
-                # now that the original image datablock may be gone.
-                try:
-                    result_img.name = old_name
+                    result_img.alpha_mode = props.rgb_image.alpha_mode
                 except Exception:
                     pass
+            props.result_image = result_img
 
-                props.rgb_image = result_img
-
-        props.result_image = result_img
         for area in bpy.context.screen.areas:
             if area.type == "IMAGE_EDITOR":
-                area.spaces.active.image = result_img
+                area.spaces.active.image = props.result_image
                 break
 
         self.report({"INFO"}, "Channel packing complete.")
@@ -499,8 +483,22 @@ class CHANNELPACKER_OT_save_image(bpy.types.Operator):
                 area.spaces.active.image = props.result_image
                 break
 
-        # Invoke Blender's built-in save-as operator.
-        bpy.ops.image.save_as("INVOKE_DEFAULT")
+        # Prefer a direct save to avoid accidental "Save As Render"/view-transform baking.
+        img = props.result_image
+        filepath = getattr(img, "filepath_raw", "") or ""
+        if filepath.lower().endswith(".png"):
+            try:
+                img.file_format = "PNG"
+            except Exception:
+                pass
+            try:
+                img.save()
+                return {"FINISHED"}
+            except Exception:
+                pass
+
+        # Fall back to Blender's file browser (but force save_as_render=False).
+        bpy.ops.image.save_as("INVOKE_DEFAULT", save_as_render=False)
         return {"FINISHED"}
 
 
