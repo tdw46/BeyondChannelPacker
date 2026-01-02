@@ -119,6 +119,20 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
         description="The resulting packed image",
     )
 
+    auto_scale_to_largest: bpy.props.BoolProperty(
+        name="Auto Scale to Largest",
+        description="If images differ in size but have similar aspect ratios, scale them to the largest image for packing",
+        default=True,
+    )
+    aspect_ratio_tolerance: bpy.props.FloatProperty(
+        name="Aspect Tolerance",
+        description="Allowed relative aspect ratio difference for auto scaling (e.g. 0.02 = 2%)",
+        default=0.02,
+        min=0.0,
+        soft_max=0.1,
+        max=0.5,
+    )
+
 
 # -----------------------------------------------------------------------------
 # Operator: Pack Channels
@@ -135,46 +149,60 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
         mode = props.mode
 
         # -----------------------------------------------------------------------------
-        # Determine a reference image to get width and height.
-        # All provided images (if any) must share these dimensions.
+        # Determine target width/height.
+        # If images differ in dimensions but have a similar aspect ratio, optionally
+        # scale them to match the largest image for packing.
         # -----------------------------------------------------------------------------
         width = height = None
 
-        def update_dimensions(img):
-            nonlocal width, height
-            if img is not None:
-                if width is None and height is None:
-                    width, height = img.size[0], img.size[1]
-                else:
-                    if img.size[0] != width or img.size[1] != height:
-                        self.report(
-                            {"ERROR"}, "All images must have the same dimensions."
-                        )
-                        return False
-            return True
+        def get_selected_images():
+            if mode == "SINGLE":
+                return [img for img in [props.rgb_image, props.alpha_image] if img]
+            return [
+                img for img in [props.r_image, props.g_image, props.b_image, props.a_image] if img
+            ]
+
+        selected_images = get_selected_images()
 
         # For SINGLE mode, the RGB image is required.
         if mode == "SINGLE":
             if props.rgb_image is None:
                 self.report({"ERROR"}, "RGB Image is required for RGB + Alpha mode.")
                 return {"CANCELLED"}
-            if not update_dimensions(props.rgb_image):
-                return {"CANCELLED"}
-            if props.alpha_image is not None:
-                if not update_dimensions(props.alpha_image):
-                    return {"CANCELLED"}
-        else:  # MULTI mode: try to update dimensions from any provided channel.
-            provided = False
-            for img in [props.r_image, props.g_image, props.b_image, props.a_image]:
-                if img is not None:
-                    provided = True
-                    if not update_dimensions(img):
-                        return {"CANCELLED"}
-            if not provided:
+        else:
+            if not selected_images:
                 self.report(
                     {"ERROR"},
                     "At least one channel image must be provided in Separate Channels mode.",
                 )
+                return {"CANCELLED"}
+
+        if not selected_images:
+            selected_images = get_selected_images()
+        if not selected_images:
+            self.report({"ERROR"}, "Could not determine image dimensions.")
+            return {"CANCELLED"}
+
+        target_img = max(selected_images, key=lambda img: img.size[0] * img.size[1])
+        width, height = int(target_img.size[0]), int(target_img.size[1])
+
+        if width <= 0 or height <= 0:
+            self.report({"ERROR"}, "Could not determine image dimensions.")
+            return {"CANCELLED"}
+
+        target_ratio = width / height
+        tol = float(props.aspect_ratio_tolerance)
+        for img in selected_images:
+            iw, ih = int(img.size[0]), int(img.size[1])
+            if iw == width and ih == height:
+                continue
+            if not props.auto_scale_to_largest:
+                self.report({"ERROR"}, "All images must have the same dimensions.")
+                return {"CANCELLED"}
+            ratio = iw / ih if ih else 0.0
+            rel_diff = abs(ratio - target_ratio) / target_ratio if target_ratio else 0.0
+            if rel_diff > tol:
+                self.report({"ERROR"}, "All images must have the same dimensions.")
                 return {"CANCELLED"}
 
         if width is None or height is None:
@@ -194,6 +222,47 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
         def convert_srgb_to_linear(arr):
             return np.where(arr < 0.04045, arr / 12.92, ((arr + 0.055) / 1.055) ** 2.4)
 
+        scaled_cache = {}
+        temp_images = []
+
+        def get_image_for_target(img):
+            if img is None:
+                return None
+            if img.size[0] == width and img.size[1] == height:
+                return img
+            cached = scaled_cache.get(img)
+            if cached is not None:
+                return cached
+            tmp = img.copy()
+            tmp.name = f"{img.name}_BCP_TMP"
+            tmp.use_fake_user = False
+            tmp.scale(width, height)
+            scaled_cache[img] = tmp
+            temp_images.append(tmp)
+            return tmp
+
+        def get_pixels_array(img):
+            img = get_image_for_target(img)
+            if img is None:
+                return None
+            if not img.pixels:
+                self.report({"ERROR"}, f"Image '{img.name}' has no pixel data.")
+                return None
+            arr = np.array(img.pixels[:], dtype=np.float32)
+            denom = width * height
+            if denom <= 0 or arr.size % denom != 0:
+                self.report(
+                    {"ERROR"},
+                    f"Image '{img.name}' pixel buffer size doesn't match its dimensions.",
+                )
+                return None
+            channels_in_buffer = arr.size // denom
+            try:
+                return arr.reshape((height, width, channels_in_buffer))
+            except Exception as e:
+                self.report({"ERROR"}, f"Error processing image '{img.name}': {e}")
+                return None
+
         # -----------------------------------------------------------------------------
         # Helper: get a 2D array from an image by flattening its data to one channel.
         # A flag (is_alpha) prevents conversion on alpha channels.
@@ -201,16 +270,8 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
         def get_channel_data(img, is_alpha=False):
             if img is None:
                 return None
-            # Ensure the image has valid pixel data.
-            if not img.pixels:
-                self.report({"ERROR"}, f"Image '{img.name}' has no pixel data.")
-                return None
-            channels = img.channels
-            arr = np.array(img.pixels[:], dtype=np.float32)
-            try:
-                arr = arr.reshape((height, width, channels))
-            except Exception as e:
-                self.report({"ERROR"}, f"Error processing image '{img.name}': {e}")
+            arr = get_pixels_array(img)
+            if arr is None:
                 return None
             # For multi‑channel images, take the first channel (assuming it is grayscale or R).
             data = arr[:, :, 0]
@@ -222,64 +283,76 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
         # -----------------------------------------------------------------------------
         # Fill the output array based on the chosen mode.
         # -----------------------------------------------------------------------------
-        if mode == "SINGLE":
-            # Process the RGB image. It might have 3 or 4 channels.
-            rgb_img = props.rgb_image
-            channels_rgb = rgb_img.channels
-            arr_rgb = np.array(rgb_img.pixels[:], dtype=np.float32)
-            try:
-                arr_rgb = arr_rgb.reshape((height, width, channels_rgb))
-            except Exception as e:
-                self.report({"ERROR"}, f"Error processing RGB image: {e}")
-                return {"CANCELLED"}
-            # Use the first three channels. If only one channel is available, duplicate it.
-            if channels_rgb >= 3:
-                if rgb_img.colorspace_settings.name == "sRGB":
-                    output[:, :, 0] = convert_srgb_to_linear(arr_rgb[:, :, 0])
-                    output[:, :, 1] = convert_srgb_to_linear(arr_rgb[:, :, 1])
-                    output[:, :, 2] = convert_srgb_to_linear(arr_rgb[:, :, 2])
-                else:
-                    output[:, :, 0] = arr_rgb[:, :, 0]
-                    output[:, :, 1] = arr_rgb[:, :, 1]
-                    output[:, :, 2] = arr_rgb[:, :, 2]
-            else:
-                if rgb_img.colorspace_settings.name == "sRGB":
-                    gray = convert_srgb_to_linear(arr_rgb[:, :, 0])
-                else:
-                    gray = arr_rgb[:, :, 0]
-                output[:, :, 0] = gray
-                output[:, :, 1] = gray
-                output[:, :, 2] = gray
-
-            # For alpha, use the provided alpha image if available; otherwise, default to opaque.
-            if props.alpha_image is not None:
-                alpha_data = get_channel_data(props.alpha_image, is_alpha=True)
-                if alpha_data is None:
+        try:
+            if mode == "SINGLE":
+                # Process the RGB image. It might have 3 or 4 channels.
+                rgb_img = props.rgb_image
+                arr_rgb = get_pixels_array(rgb_img)
+                if arr_rgb is None:
                     return {"CANCELLED"}
-                output[:, :, 3] = alpha_data
-            else:
-                output[:, :, 3] = 1.0
+                channels_rgb = arr_rgb.shape[2]
+                # Use the first three channels. If only one channel is available, duplicate it.
+                if channels_rgb >= 3:
+                    if rgb_img.colorspace_settings.name == "sRGB":
+                        output[:, :, 0] = convert_srgb_to_linear(arr_rgb[:, :, 0])
+                        output[:, :, 1] = convert_srgb_to_linear(arr_rgb[:, :, 1])
+                        output[:, :, 2] = convert_srgb_to_linear(arr_rgb[:, :, 2])
+                    else:
+                        output[:, :, 0] = arr_rgb[:, :, 0]
+                        output[:, :, 1] = arr_rgb[:, :, 1]
+                        output[:, :, 2] = arr_rgb[:, :, 2]
+                else:
+                    if rgb_img.colorspace_settings.name == "sRGB":
+                        gray = convert_srgb_to_linear(arr_rgb[:, :, 0])
+                    else:
+                        gray = arr_rgb[:, :, 0]
+                    output[:, :, 0] = gray
+                    output[:, :, 1] = gray
+                    output[:, :, 2] = gray
 
-        else:  # MULTI mode: use separate images for each channel.
-            r_data = (
-                get_channel_data(props.r_image) if props.r_image is not None else None
-            )
-            g_data = (
-                get_channel_data(props.g_image) if props.g_image is not None else None
-            )
-            b_data = (
-                get_channel_data(props.b_image) if props.b_image is not None else None
-            )
-            a_data = (
-                get_channel_data(props.a_image, is_alpha=True)
-                if props.a_image is not None
-                else None
-            )
+                # For alpha, use the provided alpha image if available; otherwise, default to opaque.
+                if props.alpha_image is not None:
+                    alpha_data = get_channel_data(props.alpha_image, is_alpha=True)
+                    if alpha_data is None:
+                        return {"CANCELLED"}
+                    output[:, :, 3] = alpha_data
+                else:
+                    output[:, :, 3] = 1.0
 
-            output[:, :, 0] = r_data if r_data is not None else 0.0
-            output[:, :, 1] = g_data if g_data is not None else 0.0
-            output[:, :, 2] = b_data if b_data is not None else 0.0
-            output[:, :, 3] = a_data if a_data is not None else 1.0
+            else:  # MULTI mode: use separate images for each channel.
+                r_data = (
+                    get_channel_data(props.r_image)
+                    if props.r_image is not None
+                    else None
+                )
+                g_data = (
+                    get_channel_data(props.g_image)
+                    if props.g_image is not None
+                    else None
+                )
+                b_data = (
+                    get_channel_data(props.b_image)
+                    if props.b_image is not None
+                    else None
+                )
+                a_data = (
+                    get_channel_data(props.a_image, is_alpha=True)
+                    if props.a_image is not None
+                    else None
+                )
+
+                output[:, :, 0] = r_data if r_data is not None else 0.0
+                output[:, :, 1] = g_data if g_data is not None else 0.0
+                output[:, :, 2] = b_data if b_data is not None else 0.0
+                output[:, :, 3] = a_data if a_data is not None else 1.0
+        finally:
+            for tmp in temp_images:
+                if not tmp:
+                    continue
+                try:
+                    bpy.data.images.remove(tmp, do_unlink=True)
+                except (ReferenceError, RuntimeError):
+                    pass
 
         # -----------------------------------------------------------------------------
         # Premultiply the RGB channels by the alpha channel to avoid white fringes in transparent areas.
@@ -349,6 +422,44 @@ class CHANNELPACKER_OT_save_image(bpy.types.Operator):
 
 
 # -----------------------------------------------------------------------------
+# Operator: Load Image From Disk (File Browser)
+# -----------------------------------------------------------------------------
+class CHANNELPACKER_OT_load_image(bpy.types.Operator):
+    """Load an image from disk and assign it to a channel slot"""
+
+    bl_idname = "channelpacker.load_image"
+    bl_label = "Load Image"
+    bl_options = {"REGISTER", "UNDO"}
+
+    target_prop: bpy.props.StringProperty(name="Target Property")
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(
+        default="*.png;*.jpg;*.jpeg;*.tga;*.tif;*.tiff;*.bmp;*.exr;*.hdr",
+        options={"HIDDEN"},
+    )
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        allowed = {"rgb_image", "alpha_image", "r_image", "g_image", "b_image", "a_image"}
+        if self.target_prop not in allowed:
+            self.report({"ERROR"}, "Invalid target image slot.")
+            return {"CANCELLED"}
+
+        props = context.scene.beyond_channel_packer
+        try:
+            img = bpy.data.images.load(self.filepath, check_existing=True)
+        except Exception as e:
+            self.report({"ERROR"}, f"Could not load image: {e}")
+            return {"CANCELLED"}
+
+        setattr(props, self.target_prop, img)
+        return {"FINISHED"}
+
+
+# -----------------------------------------------------------------------------
 # Panel: User Interface in the Image Editor's N-panel
 # -----------------------------------------------------------------------------
 class CHANNELPACKER_PT_panel(bpy.types.Panel):
@@ -366,17 +477,26 @@ class CHANNELPACKER_PT_panel(bpy.types.Panel):
 
         # Mode selection (RGB+Alpha vs. Separate Channels)
         layout.prop(props, "mode")
+        row = layout.row(align=True)
+        row.prop(props, "auto_scale_to_largest")
+        sub = row.row(align=True)
+        sub.enabled = props.auto_scale_to_largest
+        sub.prop(props, "aspect_ratio_tolerance", text="Tol")
 
         # Display the appropriate settings based on the selected mode.
         if props.mode == "SINGLE":
             box = layout.box()
             box.label(text="RGB + Alpha Mode", icon="IMAGE_DATA")
-            row = box.row()
+            row = box.row(align=True)
             row.prop(props, "rgb_image")
+            op = row.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
+            op.target_prop = "rgb_image"
             if props.rgb_image:
                 box.template_preview(props.rgb_image, show_buttons=False)
-            row = box.row()
+            row = box.row(align=True)
             row.prop(props, "alpha_image")
+            op = row.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
+            op.target_prop = "alpha_image"
             if props.alpha_image:
                 box.template_preview(props.alpha_image, show_buttons=False)
             row = box.row()
@@ -384,20 +504,28 @@ class CHANNELPACKER_PT_panel(bpy.types.Panel):
         else:
             box = layout.box()
             box.label(text="Separate Channels Mode", icon="IMAGE_DATA")
-            row = box.row()
+            row = box.row(align=True)
             row.prop(props, "r_image")
+            op = row.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
+            op.target_prop = "r_image"
             if props.r_image:
                 box.template_preview(props.r_image, show_buttons=False)
-            row = box.row()
+            row = box.row(align=True)
             row.prop(props, "g_image")
+            op = row.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
+            op.target_prop = "g_image"
             if props.g_image:
                 box.template_preview(props.g_image, show_buttons=False)
-            row = box.row()
+            row = box.row(align=True)
             row.prop(props, "b_image")
+            op = row.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
+            op.target_prop = "b_image"
             if props.b_image:
                 box.template_preview(props.b_image, show_buttons=False)
-            row = box.row()
+            row = box.row(align=True)
             row.prop(props, "a_image")
+            op = row.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
+            op.target_prop = "a_image"
             if props.a_image:
                 box.template_preview(props.a_image, show_buttons=False)
 
@@ -422,6 +550,7 @@ classes = (
     BeyondChannelPackerProperties,
     CHANNELPACKER_OT_pack_channels,
     CHANNELPACKER_OT_save_image,
+    CHANNELPACKER_OT_load_image,
     CHANNELPACKER_PT_panel,
 )
 
