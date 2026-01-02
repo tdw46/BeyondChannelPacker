@@ -47,6 +47,61 @@ def image_update_callback(prop_name):
 
 
 # -----------------------------------------------------------------------------
+# Utility: Remap image users when replacing datablocks
+# -----------------------------------------------------------------------------
+def remap_image_users(old_img, new_img):
+    """
+    Remap datablock references from old_img to new_img.
+
+    Uses Blender's built-in ID.user_remap() when available; falls back to a
+    conservative manual remap for common datablock types.
+    """
+    if old_img is None or new_img is None or old_img == new_img:
+        return
+
+    try:
+        old_img.user_remap(new_img)
+        return
+    except AttributeError:
+        pass
+
+    def remap_node_tree(node_tree):
+        if not node_tree:
+            return
+        for node in node_tree.nodes:
+            if hasattr(node, "image") and node.image == old_img:
+                node.image = new_img
+
+    for mat in bpy.data.materials:
+        if getattr(mat, "use_nodes", False):
+            remap_node_tree(getattr(mat, "node_tree", None))
+    for world in bpy.data.worlds:
+        if getattr(world, "use_nodes", False):
+            remap_node_tree(getattr(world, "node_tree", None))
+    for light in bpy.data.lights:
+        if getattr(light, "use_nodes", False):
+            remap_node_tree(getattr(light, "node_tree", None))
+    for scene in bpy.data.scenes:
+        remap_node_tree(getattr(scene, "node_tree", None))
+    for ng in bpy.data.node_groups:
+        remap_node_tree(ng)
+
+    for tex in bpy.data.textures:
+        if getattr(tex, "type", None) == "IMAGE" and getattr(tex, "image", None) == old_img:
+            tex.image = new_img
+
+    try:
+        for area in bpy.context.screen.areas:
+            if area.type != "IMAGE_EDITOR":
+                continue
+            space = area.spaces.active
+            if getattr(space, "image", None) == old_img:
+                space.image = new_img
+    except Exception:
+        pass
+
+
+# -----------------------------------------------------------------------------
 # Property Group: Stores all settings for channel packing.
 # -----------------------------------------------------------------------------
 class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
@@ -380,10 +435,38 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
         # If override is enabled in SINGLE mode, replace the original RGB image.
         # -----------------------------------------------------------------------------
         if mode == "SINGLE" and props.override_rgb:
-            old_name = props.rgb_image.name
-            bpy.data.images.remove(props.rgb_image, do_unlink=True)
-            result_img.name = old_name
-            props.rgb_image = result_img
+            old_img = props.rgb_image
+            if old_img is not None and old_img != result_img:
+                old_name = old_img.name
+
+                # Free the original name so the replacement can take it.
+                try:
+                    old_img.name = f"{old_name}_BCP_OLD"
+                except Exception:
+                    pass
+
+                try:
+                    result_img.name = old_name
+                except Exception:
+                    pass
+
+                # Remap all datablocks that referenced the original image to the
+                # replacement image before removing the old datablock.
+                remap_image_users(old_img, result_img)
+
+                try:
+                    bpy.data.images.remove(old_img, do_unlink=True)
+                except (ReferenceError, RuntimeError):
+                    pass
+
+                # If we couldn't rename earlier due to a name collision, try again
+                # now that the original image datablock may be gone.
+                try:
+                    result_img.name = old_name
+                except Exception:
+                    pass
+
+                props.rgb_image = result_img
 
         props.result_image = result_img
         for area in bpy.context.screen.areas:
