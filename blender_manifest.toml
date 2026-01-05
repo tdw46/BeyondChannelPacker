@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "beyond_channel_packer"
-version = "0.1.0"
+version = "0.1.5"
 name = "BeyondChannelPacker"
 tagline = "Channel pack images in the Image Editor (choose RGB+Alpha or 4 separate channels)."
 maintainer = "Beyond Dev (Tyler Walker)"

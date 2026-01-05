@@ -1,0 +1,6 @@
+line-length = 88
+
+[lint]
+# Blender extensions often live in a package folder that doesn't follow
+# PEP 8 module naming; allow it.
+ignore = ["N999"]

@@ -20,9 +20,12 @@ import bpy
 bl_info = {
     "name": "BeyondChannelPacker",
     "author": "Beyond Dev (Tyler Walker)",
-    "version": (0, 1, 0),
+    "version": (0, 1, 5),
     "blender": (4, 2, 0),
-    "description": "Channel pack images in the Image Editor (choose RGB+Alpha or 4 separate channels).",
+    "description": (
+        "Channel pack images in the Image Editor (choose RGB+Alpha or 4 separate "
+        "channels)."
+    ),
     "category": "Image",
 }
 
@@ -87,6 +90,44 @@ def _image_file_format_from_path(filepath: str) -> str | None:
     }.get(ext)
 
 
+def _autosave_target_for_sources(source_images):
+    for img in source_images:
+        if img is None:
+            continue
+        filepath = (
+            getattr(img, "filepath_raw", "") or getattr(img, "filepath", "") or ""
+        ).strip()
+        if not filepath:
+            continue
+        filepath = bpy.path.abspath(filepath)
+        suffix = Path(filepath).suffix
+        if not suffix:
+            continue
+        return filepath
+
+    blend_dir = bpy.path.abspath("//")
+    if blend_dir:
+        return str(Path(blend_dir) / "ChannelPacked.png")
+    return str(Path(bpy.app.tempdir or ".") / "ChannelPacked.png")
+
+
+def _autosave_format_for_path(filepath: str) -> tuple[str, str]:
+    file_format = _image_file_format_from_path(filepath) if filepath else None
+    if file_format in {"PNG", "OPEN_EXR", "TIFF", "TARGA"}:
+        return file_format, Path(filepath).suffix or ".png"
+    return "PNG", ".png"
+
+
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for i in range(1, 1000):
+        candidate = path.with_name(f"{path.stem}_{i}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    return path
+
+
 # -----------------------------------------------------------------------------
 # Utility: Update Callback to update Image Editor view when a channel image is changed.
 # -----------------------------------------------------------------------------
@@ -135,13 +176,17 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
     alpha_image: bpy.props.PointerProperty(
         name="Alpha Image",
         type=bpy.types.Image,
-        description="Image providing the Alpha channel (will be flattened to one channel)",
+        description=(
+            "Image providing the Alpha channel (will be flattened to one channel)"
+        ),
         update=image_update_callback("alpha_image"),
     )
     # New property to override the original RGB image with the packed image.
     override_rgb: bpy.props.BoolProperty(
         name="Override RGB",
-        description="Override the original RGB image with the packed image after packing",
+        description=(
+            "Override the original RGB image with the packed image after packing"
+        ),
         default=False,
     )
 
@@ -178,6 +223,13 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
         description="The resulting packed image",
     )
 
+    last_saved_path: bpy.props.StringProperty(
+        name="Saved To",
+        description="Last auto-saved packed image path",
+        subtype="FILE_PATH",
+        default="",
+    )
+
     auto_scale_to_largest: bpy.props.BoolProperty(
         name="Auto Scale to Largest",
         description=(
@@ -188,7 +240,10 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
     )
     aspect_ratio_tolerance: bpy.props.FloatProperty(
         name="Aspect Tolerance",
-        description="Allowed relative aspect ratio difference for auto scaling (e.g. 0.02 = 2%)",
+        description=(
+            "Allowed relative aspect ratio difference for auto scaling "
+            "(e.g. 0.02 = 2%)"
+        ),
         default=0.02,
         min=0.0,
         soft_max=0.1,
@@ -199,7 +254,7 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
 # -----------------------------------------------------------------------------
 # Operator: Pack Channels
 # -----------------------------------------------------------------------------
-class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
+class ChannelPackerOTPackChannels(bpy.types.Operator):
     """Pack selected channels into a new image"""
 
     bl_idname = "channelpacker.pack_channels"
@@ -209,6 +264,7 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.beyond_channel_packer
         mode = props.mode
+        props.last_saved_path = ""
 
         # -----------------------------------------------------------------------------
         # Determine target width/height.
@@ -221,7 +277,9 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
             if mode == "SINGLE":
                 return [img for img in [props.rgb_image, props.alpha_image] if img]
             return [
-                img for img in [props.r_image, props.g_image, props.b_image, props.a_image] if img
+                img
+                for img in [props.r_image, props.g_image, props.b_image, props.a_image]
+                if img
             ]
 
         selected_images = get_selected_images()
@@ -235,7 +293,8 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
             if not selected_images:
                 self.report(
                     {"ERROR"},
-                    "At least one channel image must be provided in Separate Channels mode.",
+                    "At least one channel image must be provided in "
+                    "Separate Channels mode.",
                 )
                 return {"CANCELLED"}
 
@@ -324,14 +383,20 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
             try:
                 pixels = img.pixels[:]
             except RuntimeError as exc:
-                self.report({"ERROR"}, f"Image '{img.name}' pixel data unavailable: {exc}")
+                msg = (
+                    f"Image '{img.name}' pixel data unavailable: {exc}"
+                )
+                self.report({"ERROR"}, msg)
                 return None, 0
 
             denom = width * height
             if denom <= 0 or (len(pixels) % denom) != 0:
                 self.report(
                     {"ERROR"},
-                    f"Image '{img.name}' pixel buffer size doesn't match its dimensions.",
+                    (
+                        f"Image '{img.name}' pixel buffer size doesn't match its "
+                        "dimensions."
+                    ),
                 )
                 return None, 0
             channels_in_buffer = len(pixels) // denom
@@ -366,7 +431,9 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
                 return pixels, channels_in_buffer, channel_index
 
             channels_in_buffer = arr.shape[2]
-            channel_index = 3 if (is_alpha and channels_in_buffer >= 4) else 0
+            channel_index = 0
+            if is_alpha and channels_in_buffer >= 4:
+                channel_index = 3
             return arr[:, :, channel_index]
 
         # -----------------------------------------------------------------------------
@@ -404,7 +471,8 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
                             output[out_base + 1] = gray
                             output[out_base + 2] = gray
 
-                # For alpha, use the provided alpha image if available; otherwise, default to opaque.
+                # Alpha: use the provided alpha image if available; otherwise default to
+                # opaque.
                 if props.alpha_image is not None:
                     alpha_data = get_channel_data(props.alpha_image, is_alpha=True)
                     if alpha_data is None:
@@ -414,12 +482,25 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
                     else:
                         alpha_pixels, channels_a, channel_index = alpha_data
                         for i in range(pixel_count):
-                            output[(i * 4) + 3] = alpha_pixels[(i * channels_a) + channel_index]
+                            src_idx = (i * channels_a) + channel_index
+                            output[(i * 4) + 3] = alpha_pixels[src_idx]
 
             else:  # MULTI mode: use separate images for each channel.
-                r_data = get_channel_data(props.r_image) if props.r_image is not None else None
-                g_data = get_channel_data(props.g_image) if props.g_image is not None else None
-                b_data = get_channel_data(props.b_image) if props.b_image is not None else None
+                r_data = (
+                    get_channel_data(props.r_image)
+                    if props.r_image is not None
+                    else None
+                )
+                g_data = (
+                    get_channel_data(props.g_image)
+                    if props.g_image is not None
+                    else None
+                )
+                b_data = (
+                    get_channel_data(props.b_image)
+                    if props.b_image is not None
+                    else None
+                )
                 a_data = (
                     get_channel_data(props.a_image, is_alpha=True)
                     if props.a_image is not None
@@ -439,19 +520,26 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
                     if r_data is not None:
                         r_pixels, channels_r, channel_index = r_data
                         for i in range(pixel_count):
-                            output[(i * 4) + 0] = r_pixels[(i * channels_r) + channel_index]
+                            output[(i * 4) + 0] = r_pixels[
+                                (i * channels_r) + channel_index
+                            ]
                     if g_data is not None:
                         g_pixels, channels_g, channel_index = g_data
                         for i in range(pixel_count):
-                            output[(i * 4) + 1] = g_pixels[(i * channels_g) + channel_index]
+                            output[(i * 4) + 1] = g_pixels[
+                                (i * channels_g) + channel_index
+                            ]
                     if b_data is not None:
                         b_pixels, channels_b, channel_index = b_data
                         for i in range(pixel_count):
-                            output[(i * 4) + 2] = b_pixels[(i * channels_b) + channel_index]
+                            output[(i * 4) + 2] = b_pixels[
+                                (i * channels_b) + channel_index
+                            ]
                     if a_data is not None:
                         a_pixels, channels_a, channel_index = a_data
                         for i in range(pixel_count):
-                            output[(i * 4) + 3] = a_pixels[(i * channels_a) + channel_index]
+                            src_idx = (i * channels_a) + channel_index
+                            output[(i * 4) + 3] = a_pixels[src_idx]
         finally:
             for tmp in temp_images:
                 if not tmp:
@@ -480,26 +568,82 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
             rgb_img.pixels = flat_pixels
             props.result_image = rgb_img
 
-            # If the RGB image is file-backed and is a PNG, overwrite it on disk.
-            filepath = getattr(rgb_img, "filepath_raw", "") or ""
-            if filepath.lower().endswith(".png"):
+            filepath = (
+                getattr(rgb_img, "filepath_raw", "")
+                or getattr(rgb_img, "filepath", "")
+                or ""
+            ).strip()
+            if filepath and Path(filepath).suffix:
+                filepath = bpy.path.abspath(filepath)
+                file_format = _image_file_format_from_path(filepath)
+                if file_format is not None:
+                    rgb_img.filepath_raw = filepath
+                    try:
+                        rgb_img.file_format = file_format
+                    except (AttributeError, TypeError):
+                        pass
+                    try:
+                        rgb_img.save()
+                        props.last_saved_path = filepath
+                    except RuntimeError as exc:
+                        self.report(
+                            {"WARNING"},
+                            (
+                                f"Packed, but could not overwrite source file: "
+                                f"{exc}"
+                            ),
+                        )
+                else:
+                    self.report(
+                        {"WARNING"},
+                        (
+                            "Source extension not supported for overwrite; "
+                            "saving a PNG copy instead."
+                        ),
+                    )
+            if not props.last_saved_path:
+                sources = [props.rgb_image, props.alpha_image]
+                base_target = _autosave_target_for_sources(sources)
+                base_target_path = Path(bpy.path.abspath(base_target))
+                out_dir = (
+                    base_target_path.parent
+                    if str(base_target_path.parent)
+                    else Path(".")
+                )
+                stem = base_target_path.stem or "ChannelPacked"
+                out_stem = (
+                    stem
+                    if stem == "ChannelPacked" or stem.endswith("_packed")
+                    else f"{stem}_packed"
+                )
+                out_path = _unique_path(out_dir / f"{out_stem}.png")
+
+                orig_filepath_raw = getattr(rgb_img, "filepath_raw", "")
+                orig_file_format = getattr(rgb_img, "file_format", None)
+                rgb_img.filepath_raw = str(out_path)
                 try:
                     rgb_img.file_format = "PNG"
                 except (AttributeError, TypeError):
                     pass
                 try:
                     rgb_img.save()
+                    props.last_saved_path = str(out_path)
                 except RuntimeError as exc:
-                    self.report({"WARNING"}, f"Packed, but could not overwrite PNG: {exc}")
-            else:
-                self.report(
-                    {"WARNING"},
-                    "Packed into the RGB image datablock, but did not auto-save (source is not a .png).",
-                )
+                    self.report(
+                        {"WARNING"},
+                        f"Packed, but could not auto-save copy: {exc}",
+                    )
+                finally:
+                    rgb_img.filepath_raw = orig_filepath_raw
+                    if orig_file_format is not None:
+                        try:
+                            rgb_img.file_format = orig_file_format
+                        except (AttributeError, TypeError):
+                            pass
         else:
-            # -----------------------------------------------------------------------------
+            # -------------------------------------------------------------------------
             # Create a new image datablock for the packed result.
-            # -----------------------------------------------------------------------------
+            # -------------------------------------------------------------------------
             result_img = context.blend_data.images.new(
                 name="ChannelPacked",
                 width=width,
@@ -510,7 +654,9 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
             result_img.pixels = flat_pixels
             if mode == "SINGLE" and props.rgb_image is not None:
                 try:
-                    result_img.colorspace_settings.name = props.rgb_image.colorspace_settings.name
+                    result_img.colorspace_settings.name = (
+                        props.rgb_image.colorspace_settings.name
+                    )
                 except (AttributeError, TypeError):
                     pass
                 try:
@@ -519,82 +665,56 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
                     pass
             props.result_image = result_img
 
+            # Auto-save packed result to disk.
+            sources = (
+                [props.rgb_image, props.alpha_image]
+                if mode == "SINGLE"
+                else [props.r_image, props.g_image, props.b_image, props.a_image]
+            )
+            base_target = _autosave_target_for_sources(sources)
+            base_target_path = Path(bpy.path.abspath(base_target))
+            file_format, ext = _autosave_format_for_path(str(base_target_path))
+
+            stem = base_target_path.stem or "ChannelPacked"
+            out_dir = (
+                base_target_path.parent if str(base_target_path.parent) else Path(".")
+            )
+            if stem == "ChannelPacked" or stem.endswith("_packed"):
+                out_stem = stem
+            else:
+                out_stem = f"{stem}_packed"
+            out_path = _unique_path(out_dir / f"{out_stem}{ext}")
+
+            props.result_image.filepath_raw = str(out_path)
+            try:
+                props.result_image.file_format = file_format
+            except (AttributeError, TypeError):
+                pass
+            try:
+                props.result_image.save()
+                props.last_saved_path = str(out_path)
+            except RuntimeError as exc:
+                self.report(
+                    {"WARNING"},
+                    f"Packed, but could not auto-save result: {exc}",
+                )
+
         _set_active_image_in_image_editor(context, props.result_image)
 
-        self.report({"INFO"}, "Channel packing complete.")
-        return {"FINISHED"}
-
-
-# -----------------------------------------------------------------------------
-# Operator: Save Packed Image
-# -----------------------------------------------------------------------------
-class CHANNELPACKER_OT_save_image(bpy.types.Operator):
-    """Save the packed image to disk"""
-
-    bl_idname = "channelpacker.save_image"
-    bl_label = "Save Packed Image"
-
-    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
-    filter_glob: bpy.props.StringProperty(
-        default="*.png;*.jpg;*.jpeg;*.tga;*.tif;*.tiff;*.bmp;*.exr;*.hdr",
-        options={"HIDDEN"},
-    )
-
-    def invoke(self, context, _event):
-        props = context.scene.beyond_channel_packer
-        img = props.result_image
-        if img is None:
-            self.report({"ERROR"}, "No packed image to save.")
-            return {"CANCELLED"}
-
-        filepath = (getattr(img, "filepath_raw", "") or getattr(img, "filepath", "") or "").strip()
-        if not filepath:
-            filepath = "channel_packed.png"
-        if not Path(filepath).suffix:
-            filepath = f"{filepath}.png"
-        self.filepath = filepath
-
-        context.window_manager.fileselect_add(self)
-        return {"RUNNING_MODAL"}
-
-    def execute(self, context):
-        props = context.scene.beyond_channel_packer
-        img = props.result_image
-        if img is None:
-            self.report({"ERROR"}, "No packed image to save.")
-            return {"CANCELLED"}
-
-        filepath = (self.filepath or "").strip()
-        if not filepath:
-            self.report({"ERROR"}, "No filepath selected.")
-            return {"CANCELLED"}
-
-        file_format = _image_file_format_from_path(filepath)
-        if file_format is None:
-            self.report({"ERROR"}, "Unsupported file extension for saving.")
-            return {"CANCELLED"}
-
-        _set_active_image_in_image_editor(context, img)
-
-        img.filepath_raw = filepath
-        try:
-            img.file_format = file_format
-        except (AttributeError, TypeError):
-            pass
-
-        try:
-            img.save()
-        except RuntimeError as exc:
-            self.report({"ERROR"}, f"Could not save image: {exc}")
-            return {"CANCELLED"}
-
+        if props.last_saved_path:
+            self.report(
+                {"INFO"},
+                f"Channel packing complete. Saved: {props.last_saved_path}",
+            )
+        else:
+            self.report({"INFO"}, "Channel packing complete.")
         return {"FINISHED"}
 
 
 # -----------------------------------------------------------------------------
 # Operator: Load Image From Disk (File Browser)
 # -----------------------------------------------------------------------------
-class CHANNELPACKER_OT_load_image(bpy.types.Operator):
+class ChannelPackerOTLoadImage(bpy.types.Operator):
     """Load an image from disk and assign it to a channel slot"""
 
     bl_idname = "channelpacker.load_image"
@@ -613,7 +733,14 @@ class CHANNELPACKER_OT_load_image(bpy.types.Operator):
         return {"RUNNING_MODAL"}
 
     def execute(self, context):
-        allowed = {"rgb_image", "alpha_image", "r_image", "g_image", "b_image", "a_image"}
+        allowed = {
+            "rgb_image",
+            "alpha_image",
+            "r_image",
+            "g_image",
+            "b_image",
+            "a_image",
+        }
         if self.target_prop not in allowed:
             self.report({"ERROR"}, "Invalid target image slot.")
             return {"CANCELLED"}
@@ -632,7 +759,7 @@ class CHANNELPACKER_OT_load_image(bpy.types.Operator):
 # -----------------------------------------------------------------------------
 # Panel: User Interface in the Image Editor's N-panel
 # -----------------------------------------------------------------------------
-class CHANNELPACKER_PT_panel(bpy.types.Panel):
+class ChannelPackerPTPanel(bpy.types.Panel):
     """Panel for channel packing in the Image Editor"""
 
     bl_label = "Beyond Channel Packer"
@@ -645,72 +772,63 @@ class CHANNELPACKER_PT_panel(bpy.types.Panel):
         layout = self.layout
         props = context.scene.beyond_channel_packer
 
-        # Mode selection (RGB+Alpha vs. Separate Channels)
-        layout.prop(props, "mode")
-        row = layout.row(align=True)
-        row.prop(props, "auto_scale_to_largest")
-        sub = row.row(align=True)
+        def draw_slot(parent, prop_name: str, label: str, label_factor: float):
+            slot = parent.box()
+            row = slot.row(align=True)
+            split = row.split(factor=label_factor, align=True)
+            split.label(text=label)
+            right = split.row(align=True)
+            right.prop(props, prop_name, text="")
+            op = right.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
+            op.target_prop = prop_name
+
+        mode_box = layout.box()
+        mode_box.label(text="Mode", icon="OPTIONS")
+        mode_box.row(align=True).prop(props, "mode", expand=True)
+
+        options_box = layout.box()
+        options_box.label(text="Image Options", icon="PREFERENCES")
+        row = options_box.row(align=True)
+        row.prop(props, "auto_scale_to_largest", text="Auto Scale to Largest")
+        override_row = row.row(align=True)
+        override_row.enabled = props.mode == "SINGLE"
+        override_row.prop(props, "override_rgb", text="Override RGB", toggle=True)
+        sub = options_box.row(align=True)
         sub.enabled = props.auto_scale_to_largest
-        sub.prop(props, "aspect_ratio_tolerance", text="Tol")
+        sub.prop(props, "aspect_ratio_tolerance", text="Aspect Tolerance")
 
-        # Display the appropriate settings based on the selected mode.
+        layout.separator()
+        layout.separator()
+
+        sources_box = layout.box()
+        sources_box.label(text="Source Images", icon="IMAGE_DATA")
         if props.mode == "SINGLE":
-            box = layout.box()
-            box.label(text="RGB + Alpha Mode", icon="IMAGE_DATA")
-            row = box.row(align=True)
-            row.prop(props, "rgb_image")
-            op = row.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
-            op.target_prop = "rgb_image"
-            if props.rgb_image:
-                box.template_preview(props.rgb_image, show_buttons=False)
-            row = box.row(align=True)
-            row.prop(props, "alpha_image")
-            op = row.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
-            op.target_prop = "alpha_image"
-            if props.alpha_image:
-                box.template_preview(props.alpha_image, show_buttons=False)
-            row = box.row()
-            row.prop(props, "override_rgb")
+            draw_slot(sources_box, "rgb_image", "RGB", 0.32)
+            draw_slot(sources_box, "alpha_image", "Alpha (Optional)", 0.32)
         else:
-            box = layout.box()
-            box.label(text="Separate Channels Mode", icon="IMAGE_DATA")
-            row = box.row(align=True)
-            row.prop(props, "r_image")
-            op = row.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
-            op.target_prop = "r_image"
-            if props.r_image:
-                box.template_preview(props.r_image, show_buttons=False)
-            row = box.row(align=True)
-            row.prop(props, "g_image")
-            op = row.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
-            op.target_prop = "g_image"
-            if props.g_image:
-                box.template_preview(props.g_image, show_buttons=False)
-            row = box.row(align=True)
-            row.prop(props, "b_image")
-            op = row.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
-            op.target_prop = "b_image"
-            if props.b_image:
-                box.template_preview(props.b_image, show_buttons=False)
-            row = box.row(align=True)
-            row.prop(props, "a_image")
-            op = row.operator("channelpacker.load_image", text="", icon="FILE_FOLDER")
-            op.target_prop = "a_image"
-            if props.a_image:
-                box.template_preview(props.a_image, show_buttons=False)
+            grid = sources_box.grid_flow(
+                columns=2, even_columns=True, even_rows=False, align=True
+            )
+            draw_slot(grid, "r_image", "Red", 0.22)
+            draw_slot(grid, "g_image", "Green", 0.22)
+            draw_slot(grid, "b_image", "Blue", 0.22)
+            draw_slot(grid, "a_image", "Alpha", 0.22)
 
         layout.separator()
-        # Button to pack channels.
-        layout.operator("channelpacker.pack_channels", icon="FILE_BLEND")
+        layout.separator()
 
-        # If a packed image exists, show a preview.
+        result_box = layout.box()
+        result_box.label(text="Result", icon="RENDER_RESULT")
+        result_box.operator("channelpacker.pack_channels", icon="FILE_BLEND")
+
         if props.result_image:
-            layout.label(text="Result Preview:")
-            layout.template_preview(props.result_image, show_buttons=False)
+            result_box.template_preview(props.result_image, show_buttons=False)
+        else:
+            result_box.label(text="No packed result yet.")
 
-        layout.separator()
-        # Button to save the packed image.
-        layout.operator("channelpacker.save_image", icon="IMAGE")
+        saved_row = result_box.row()
+        saved_row.enabled = False
+        saved_row.prop(props, "last_saved_path")
 
 
 # -----------------------------------------------------------------------------
@@ -718,10 +836,9 @@ class CHANNELPACKER_PT_panel(bpy.types.Panel):
 # -----------------------------------------------------------------------------
 classes = (
     BeyondChannelPackerProperties,
-    CHANNELPACKER_OT_pack_channels,
-    CHANNELPACKER_OT_save_image,
-    CHANNELPACKER_OT_load_image,
-    CHANNELPACKER_PT_panel,
+    ChannelPackerOTPackChannels,
+    ChannelPackerOTLoadImage,
+    ChannelPackerPTPanel,
 )
 
 
