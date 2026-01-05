@@ -1,0 +1,37 @@
+schema_version = "1.0.0"
+id = "beyond_channel_packer"
+version = "0.1.0"
+name = "BeyondChannelPacker"
+tagline = "Channel pack images in the Image Editor (choose RGB+Alpha or 4 separate channels)."
+maintainer = "Beyond Dev (Tyler Walker)"
+type = "add-on"
+blender_version_min = "4.2.0"
+blender_version_max = "5.0.999"
+license = ["SPDX:GPL-2.0-or-later"]
+
+tags = ["Image"]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  ".mypy_cache/",
+  "/.git/",
+  "/.github/",
+  ".gitignore",
+  ".gitattributes",
+  "*.pyc",
+  "*.pyo",
+  "*.pyd",
+  "*.zip",
+  "*.log",
+  "*.bat",
+  ".DS_Store",
+  "Thumbs.db",
+  ".vscode/",
+  ".idea/",
+  "*.egg-info/",
+  ".pytest_cache/",
+  ".tox/",
+  ".coverage",
+  "*.sublime-*",
+]

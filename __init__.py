@@ -11,17 +11,80 @@
 #
 # ***** END GPL LICENSE BLOCK *****
 
+from __future__ import annotations
+
+from pathlib import Path
+
 import bpy
-import numpy as np
 
 bl_info = {
     "name": "BeyondChannelPacker",
     "author": "Beyond Dev (Tyler Walker)",
     "version": (0, 1, 0),
-    "blender": (2, 80, 0),
+    "blender": (4, 2, 0),
     "description": "Channel pack images in the Image Editor (choose RGB+Alpha or 4 separate channels).",
     "category": "Image",
 }
+
+
+# -----------------------------------------------------------------------------
+# Compatibility / helpers
+# -----------------------------------------------------------------------------
+def _get_numpy():
+    try:
+        import numpy as np
+    except ModuleNotFoundError:
+        return None
+    return np
+
+
+def _iter_image_editor_spaces(context):
+    wm = getattr(context, "window_manager", None)
+    if wm is not None:
+        for window in wm.windows:
+            screen = window.screen
+            if screen is None:
+                continue
+            for area in screen.areas:
+                if area.type != "IMAGE_EDITOR":
+                    continue
+                space = area.spaces.active
+                if space is not None:
+                    yield space
+        return
+
+    screen = getattr(context, "screen", None)
+    if screen is None:
+        return
+    for area in screen.areas:
+        if area.type != "IMAGE_EDITOR":
+            continue
+        space = area.spaces.active
+        if space is not None:
+            yield space
+
+
+def _set_active_image_in_image_editor(context, image):
+    if image is None:
+        return
+    for space in _iter_image_editor_spaces(context):
+        space.image = image
+        break
+
+
+def _image_file_format_from_path(filepath: str) -> str | None:
+    ext = Path(filepath).suffix.lower()
+    return {
+        ".png": "PNG",
+        ".jpg": "JPEG",
+        ".jpeg": "JPEG",
+        ".tga": "TARGA",
+        ".tif": "TIFF",
+        ".tiff": "TIFF",
+        ".bmp": "BMP",
+        ".exr": "OPEN_EXR",
+        ".hdr": "HDR",
+    }.get(ext)
 
 
 # -----------------------------------------------------------------------------
@@ -37,68 +100,9 @@ def image_update_callback(prop_name):
     def update(self, context):
         img = getattr(self, prop_name)
         if img is not None:
-            # Iterate over all screen areas to update the image editor display.
-            for area in bpy.context.screen.areas:
-                if area.type == "IMAGE_EDITOR":
-                    area.spaces.active.image = img
-                    break
+            _set_active_image_in_image_editor(context, img)
 
     return update
-
-
-# -----------------------------------------------------------------------------
-# Utility: Remap image users when replacing datablocks
-# -----------------------------------------------------------------------------
-def remap_image_users(old_img, new_img):
-    """
-    Remap datablock references from old_img to new_img.
-
-    Uses Blender's built-in ID.user_remap() when available; falls back to a
-    conservative manual remap for common datablock types.
-    """
-    if old_img is None or new_img is None or old_img == new_img:
-        return
-
-    try:
-        old_img.user_remap(new_img)
-        return
-    except AttributeError:
-        pass
-
-    def remap_node_tree(node_tree):
-        if not node_tree:
-            return
-        for node in node_tree.nodes:
-            if hasattr(node, "image") and node.image == old_img:
-                node.image = new_img
-
-    for mat in bpy.data.materials:
-        if getattr(mat, "use_nodes", False):
-            remap_node_tree(getattr(mat, "node_tree", None))
-    for world in bpy.data.worlds:
-        if getattr(world, "use_nodes", False):
-            remap_node_tree(getattr(world, "node_tree", None))
-    for light in bpy.data.lights:
-        if getattr(light, "use_nodes", False):
-            remap_node_tree(getattr(light, "node_tree", None))
-    for scene in bpy.data.scenes:
-        remap_node_tree(getattr(scene, "node_tree", None))
-    for ng in bpy.data.node_groups:
-        remap_node_tree(ng)
-
-    for tex in bpy.data.textures:
-        if getattr(tex, "type", None) == "IMAGE" and getattr(tex, "image", None) == old_img:
-            tex.image = new_img
-
-    try:
-        for area in bpy.context.screen.areas:
-            if area.type != "IMAGE_EDITOR":
-                continue
-            space = area.spaces.active
-            if getattr(space, "image", None) == old_img:
-                space.image = new_img
-    except Exception:
-        pass
 
 
 # -----------------------------------------------------------------------------
@@ -176,7 +180,10 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
 
     auto_scale_to_largest: bpy.props.BoolProperty(
         name="Auto Scale to Largest",
-        description="If images differ in size but have similar aspect ratios, scale them to the largest image for packing",
+        description=(
+            "If images differ in size but have similar aspect ratios, "
+            "scale them to the largest image for packing"
+        ),
         default=True,
     )
     aspect_ratio_tolerance: bpy.props.FloatProperty(
@@ -270,11 +277,22 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
             return {"CANCELLED"}
 
         # -----------------------------------------------------------------------------
-        # Prepare an output array of shape (height, width, 4).
-        # We always produce an RGBA output. If a channel image is missing,
-        # default to 0 for colors and 1 for alpha.
+        # Prepare an output buffer of RGBA floats (row-major order).
+        # Defaults: RGB=0, A=1.
         # -----------------------------------------------------------------------------
-        output = np.zeros((height, width, 4), dtype=np.float32)
+        np = _get_numpy()
+        pixel_count = width * height
+        if pixel_count <= 0:
+            self.report({"ERROR"}, "Could not determine image dimensions.")
+            return {"CANCELLED"}
+
+        if np is not None:
+            output = np.zeros((height, width, 4), dtype=np.float32)
+            output[:, :, 3] = 1.0
+        else:
+            output = [0.0] * (pixel_count * 4)
+            for i in range(pixel_count):
+                output[(i * 4) + 3] = 1.0
 
         scaled_cache = {}
         temp_images = []
@@ -290,36 +308,51 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
             tmp = img.copy()
             tmp.name = f"{img.name}_BCP_TMP"
             tmp.use_fake_user = False
-            tmp.scale(width, height)
+            try:
+                tmp.scale(width, height)
+            except RuntimeError as exc:
+                self.report({"ERROR"}, f"Could not scale image '{img.name}': {exc}")
+                return None
             scaled_cache[img] = tmp
             temp_images.append(tmp)
             return tmp
 
-        def get_pixels_array(img):
+        def get_pixels_flat(img):
             img = get_image_for_target(img)
             if img is None:
-                return None
-            if not img.pixels:
-                self.report({"ERROR"}, f"Image '{img.name}' has no pixel data.")
-                return None
-            arr = np.array(img.pixels[:], dtype=np.float32)
+                return None, 0
+            try:
+                pixels = img.pixels[:]
+            except RuntimeError as exc:
+                self.report({"ERROR"}, f"Image '{img.name}' pixel data unavailable: {exc}")
+                return None, 0
+
             denom = width * height
-            if denom <= 0 or arr.size % denom != 0:
+            if denom <= 0 or (len(pixels) % denom) != 0:
                 self.report(
                     {"ERROR"},
                     f"Image '{img.name}' pixel buffer size doesn't match its dimensions.",
                 )
+                return None, 0
+            channels_in_buffer = len(pixels) // denom
+            return pixels, channels_in_buffer
+
+        def get_pixels_array(img):
+            pixels, channels_in_buffer = get_pixels_flat(img)
+            if pixels is None:
                 return None
-            channels_in_buffer = arr.size // denom
+            if np is None:
+                return pixels, channels_in_buffer
+            arr = np.asarray(pixels, dtype=np.float32)
             try:
                 return arr.reshape((height, width, channels_in_buffer))
-            except Exception as e:
-                self.report({"ERROR"}, f"Error processing image '{img.name}': {e}")
+            except ValueError as exc:
+                self.report({"ERROR"}, f"Error processing image '{img.name}': {exc}")
                 return None
 
         # -----------------------------------------------------------------------------
         # Helper: get a 2D array from an image by flattening its data to one channel.
-        # A flag (is_alpha) prevents conversion on alpha channels.
+        # When is_alpha=True and the source has an alpha channel, prefer it.
         # -----------------------------------------------------------------------------
         def get_channel_data(img, is_alpha=False):
             if img is None:
@@ -327,78 +360,111 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
             arr = get_pixels_array(img)
             if arr is None:
                 return None
-            # For multi‑channel images, take the first channel (assuming it is grayscale or R).
-            data = arr[:, :, 0]
-            return data
+            if np is None:
+                pixels, channels_in_buffer = arr
+                channel_index = 3 if (is_alpha and channels_in_buffer >= 4) else 0
+                return pixels, channels_in_buffer, channel_index
+
+            channels_in_buffer = arr.shape[2]
+            channel_index = 3 if (is_alpha and channels_in_buffer >= 4) else 0
+            return arr[:, :, channel_index]
 
         # -----------------------------------------------------------------------------
         # Fill the output array based on the chosen mode.
         # -----------------------------------------------------------------------------
         try:
             if mode == "SINGLE":
-                # Process the RGB image. It might have 3 or 4 channels.
                 rgb_img = props.rgb_image
                 arr_rgb = get_pixels_array(rgb_img)
                 if arr_rgb is None:
                     return {"CANCELLED"}
-                channels_rgb = arr_rgb.shape[2]
-                # Use the first three channels. If only one channel is available, duplicate it.
-                if channels_rgb >= 3:
-                    output[:, :, 0] = arr_rgb[:, :, 0]
-                    output[:, :, 1] = arr_rgb[:, :, 1]
-                    output[:, :, 2] = arr_rgb[:, :, 2]
+                if np is not None:
+                    channels_rgb = arr_rgb.shape[2]
+                    if channels_rgb >= 3:
+                        output[:, :, 0] = arr_rgb[:, :, 0]
+                        output[:, :, 1] = arr_rgb[:, :, 1]
+                        output[:, :, 2] = arr_rgb[:, :, 2]
+                    else:
+                        gray = arr_rgb[:, :, 0]
+                        output[:, :, 0] = gray
+                        output[:, :, 1] = gray
+                        output[:, :, 2] = gray
                 else:
-                    gray = arr_rgb[:, :, 0]
-                    output[:, :, 0] = gray
-                    output[:, :, 1] = gray
-                    output[:, :, 2] = gray
+                    rgb_pixels, channels_rgb = arr_rgb
+                    for i in range(pixel_count):
+                        out_base = i * 4
+                        in_base = i * channels_rgb
+                        if channels_rgb >= 3:
+                            output[out_base + 0] = rgb_pixels[in_base + 0]
+                            output[out_base + 1] = rgb_pixels[in_base + 1]
+                            output[out_base + 2] = rgb_pixels[in_base + 2]
+                        else:
+                            gray = rgb_pixels[in_base + 0]
+                            output[out_base + 0] = gray
+                            output[out_base + 1] = gray
+                            output[out_base + 2] = gray
 
                 # For alpha, use the provided alpha image if available; otherwise, default to opaque.
                 if props.alpha_image is not None:
                     alpha_data = get_channel_data(props.alpha_image, is_alpha=True)
                     if alpha_data is None:
                         return {"CANCELLED"}
-                    output[:, :, 3] = alpha_data
-                else:
-                    output[:, :, 3] = 1.0
+                    if np is not None:
+                        output[:, :, 3] = alpha_data
+                    else:
+                        alpha_pixels, channels_a, channel_index = alpha_data
+                        for i in range(pixel_count):
+                            output[(i * 4) + 3] = alpha_pixels[(i * channels_a) + channel_index]
 
             else:  # MULTI mode: use separate images for each channel.
-                r_data = (
-                    get_channel_data(props.r_image)
-                    if props.r_image is not None
-                    else None
-                )
-                g_data = (
-                    get_channel_data(props.g_image)
-                    if props.g_image is not None
-                    else None
-                )
-                b_data = (
-                    get_channel_data(props.b_image)
-                    if props.b_image is not None
-                    else None
-                )
+                r_data = get_channel_data(props.r_image) if props.r_image is not None else None
+                g_data = get_channel_data(props.g_image) if props.g_image is not None else None
+                b_data = get_channel_data(props.b_image) if props.b_image is not None else None
                 a_data = (
                     get_channel_data(props.a_image, is_alpha=True)
                     if props.a_image is not None
                     else None
                 )
 
-                output[:, :, 0] = r_data if r_data is not None else 0.0
-                output[:, :, 1] = g_data if g_data is not None else 0.0
-                output[:, :, 2] = b_data if b_data is not None else 0.0
-                output[:, :, 3] = a_data if a_data is not None else 1.0
+                if np is not None:
+                    if r_data is not None:
+                        output[:, :, 0] = r_data
+                    if g_data is not None:
+                        output[:, :, 1] = g_data
+                    if b_data is not None:
+                        output[:, :, 2] = b_data
+                    if a_data is not None:
+                        output[:, :, 3] = a_data
+                else:
+                    if r_data is not None:
+                        r_pixels, channels_r, channel_index = r_data
+                        for i in range(pixel_count):
+                            output[(i * 4) + 0] = r_pixels[(i * channels_r) + channel_index]
+                    if g_data is not None:
+                        g_pixels, channels_g, channel_index = g_data
+                        for i in range(pixel_count):
+                            output[(i * 4) + 1] = g_pixels[(i * channels_g) + channel_index]
+                    if b_data is not None:
+                        b_pixels, channels_b, channel_index = b_data
+                        for i in range(pixel_count):
+                            output[(i * 4) + 2] = b_pixels[(i * channels_b) + channel_index]
+                    if a_data is not None:
+                        a_pixels, channels_a, channel_index = a_data
+                        for i in range(pixel_count):
+                            output[(i * 4) + 3] = a_pixels[(i * channels_a) + channel_index]
         finally:
             for tmp in temp_images:
                 if not tmp:
                     continue
                 try:
-                    bpy.data.images.remove(tmp, do_unlink=True)
+                    context.blend_data.images.remove(tmp, do_unlink=True)
                 except (ReferenceError, RuntimeError):
                     pass
 
-        # Flatten the output array to a 1D list (row‑major order) for Blender.
-        flat_pixels = output.flatten()
+        if np is not None:
+            flat_pixels = output.reshape(-1).tolist()
+        else:
+            flat_pixels = output
 
         # -----------------------------------------------------------------------------
         # If override is enabled in SINGLE mode, write pixels back into the original
@@ -411,7 +477,7 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
                 return {"CANCELLED"}
 
             rgb_img = props.rgb_image
-            rgb_img.pixels = flat_pixels.tolist()
+            rgb_img.pixels = flat_pixels
             props.result_image = rgb_img
 
             # If the RGB image is file-backed and is a PNG, overwrite it on disk.
@@ -419,12 +485,12 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
             if filepath.lower().endswith(".png"):
                 try:
                     rgb_img.file_format = "PNG"
-                except Exception:
+                except (AttributeError, TypeError):
                     pass
                 try:
                     rgb_img.save()
-                except Exception as e:
-                    self.report({"WARNING"}, f"Packed, but could not overwrite PNG: {e}")
+                except RuntimeError as exc:
+                    self.report({"WARNING"}, f"Packed, but could not overwrite PNG: {exc}")
             else:
                 self.report(
                     {"WARNING"},
@@ -434,29 +500,26 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
             # -----------------------------------------------------------------------------
             # Create a new image datablock for the packed result.
             # -----------------------------------------------------------------------------
-            result_img = bpy.data.images.new(
+            result_img = context.blend_data.images.new(
                 name="ChannelPacked",
                 width=width,
                 height=height,
                 alpha=True,
                 float_buffer=True,
             )
-            result_img.pixels = flat_pixels.tolist()
+            result_img.pixels = flat_pixels
             if mode == "SINGLE" and props.rgb_image is not None:
                 try:
                     result_img.colorspace_settings.name = props.rgb_image.colorspace_settings.name
-                except Exception:
+                except (AttributeError, TypeError):
                     pass
                 try:
                     result_img.alpha_mode = props.rgb_image.alpha_mode
-                except Exception:
+                except (AttributeError, TypeError):
                     pass
             props.result_image = result_img
 
-        for area in bpy.context.screen.areas:
-            if area.type == "IMAGE_EDITOR":
-                area.spaces.active.image = props.result_image
-                break
+        _set_active_image_in_image_editor(context, props.result_image)
 
         self.report({"INFO"}, "Channel packing complete.")
         return {"FINISHED"}
@@ -466,39 +529,65 @@ class CHANNELPACKER_OT_pack_channels(bpy.types.Operator):
 # Operator: Save Packed Image
 # -----------------------------------------------------------------------------
 class CHANNELPACKER_OT_save_image(bpy.types.Operator):
-    """Save the packed image using Blender's save image functionality"""
+    """Save the packed image to disk"""
 
     bl_idname = "channelpacker.save_image"
     bl_label = "Save Packed Image"
 
-    def execute(self, context):
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(
+        default="*.png;*.jpg;*.jpeg;*.tga;*.tif;*.tiff;*.bmp;*.exr;*.hdr",
+        options={"HIDDEN"},
+    )
+
+    def invoke(self, context, _event):
         props = context.scene.beyond_channel_packer
-        if props.result_image is None:
+        img = props.result_image
+        if img is None:
             self.report({"ERROR"}, "No packed image to save.")
             return {"CANCELLED"}
 
-        # Set the active image in the image editor to the result.
-        for area in bpy.context.screen.areas:
-            if area.type == "IMAGE_EDITOR":
-                area.spaces.active.image = props.result_image
-                break
+        filepath = (getattr(img, "filepath_raw", "") or getattr(img, "filepath", "") or "").strip()
+        if not filepath:
+            filepath = "channel_packed.png"
+        if not Path(filepath).suffix:
+            filepath = f"{filepath}.png"
+        self.filepath = filepath
 
-        # Prefer a direct save to avoid accidental "Save As Render"/view-transform baking.
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        props = context.scene.beyond_channel_packer
         img = props.result_image
-        filepath = getattr(img, "filepath_raw", "") or ""
-        if filepath.lower().endswith(".png"):
-            try:
-                img.file_format = "PNG"
-            except Exception:
-                pass
-            try:
-                img.save()
-                return {"FINISHED"}
-            except Exception:
-                pass
+        if img is None:
+            self.report({"ERROR"}, "No packed image to save.")
+            return {"CANCELLED"}
 
-        # Fall back to Blender's file browser (but force save_as_render=False).
-        bpy.ops.image.save_as("INVOKE_DEFAULT", save_as_render=False)
+        filepath = (self.filepath or "").strip()
+        if not filepath:
+            self.report({"ERROR"}, "No filepath selected.")
+            return {"CANCELLED"}
+
+        file_format = _image_file_format_from_path(filepath)
+        if file_format is None:
+            self.report({"ERROR"}, "Unsupported file extension for saving.")
+            return {"CANCELLED"}
+
+        _set_active_image_in_image_editor(context, img)
+
+        img.filepath_raw = filepath
+        try:
+            img.file_format = file_format
+        except (AttributeError, TypeError):
+            pass
+
+        try:
+            img.save()
+        except RuntimeError as exc:
+            self.report({"ERROR"}, f"Could not save image: {exc}")
+            return {"CANCELLED"}
+
         return {"FINISHED"}
 
 
@@ -519,7 +608,7 @@ class CHANNELPACKER_OT_load_image(bpy.types.Operator):
         options={"HIDDEN"},
     )
 
-    def invoke(self, context, event):
+    def invoke(self, context, _event):
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
@@ -531,9 +620,9 @@ class CHANNELPACKER_OT_load_image(bpy.types.Operator):
 
         props = context.scene.beyond_channel_packer
         try:
-            img = bpy.data.images.load(self.filepath, check_existing=True)
-        except Exception as e:
-            self.report({"ERROR"}, f"Could not load image: {e}")
+            img = context.blend_data.images.load(self.filepath, check_existing=True)
+        except RuntimeError as exc:
+            self.report({"ERROR"}, f"Could not load image: {exc}")
             return {"CANCELLED"}
 
         setattr(props, self.target_prop, img)
