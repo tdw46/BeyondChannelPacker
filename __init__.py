@@ -347,11 +347,8 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
 
         if np is not None:
             output = np.zeros((height, width, 4), dtype=np.float32)
-            output[:, :, 3] = 1.0
         else:
             output = [0.0] * (pixel_count * 4)
-            for i in range(pixel_count):
-                output[(i * 4) + 3] = 1.0
 
         scaled_cache = {}
         temp_images = []
@@ -416,10 +413,9 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                 return None
 
         # -----------------------------------------------------------------------------
-        # Helper: get a 2D array from an image by flattening its data to one channel.
-        # When is_alpha=True and the source has an alpha channel, prefer it.
+        # Helper: get a 2D array from an image by extracting its first channel.
         # -----------------------------------------------------------------------------
-        def get_channel_data(img, is_alpha=False):
+        def get_channel_data(img):
             if img is None:
                 return None
             arr = get_pixels_array(img)
@@ -427,14 +423,8 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                 return None
             if np is None:
                 pixels, channels_in_buffer = arr
-                channel_index = 3 if (is_alpha and channels_in_buffer >= 4) else 0
-                return pixels, channels_in_buffer, channel_index
-
-            channels_in_buffer = arr.shape[2]
-            channel_index = 0
-            if is_alpha and channels_in_buffer >= 4:
-                channel_index = 3
-            return arr[:, :, channel_index]
+                return pixels, channels_in_buffer, 0
+            return arr[:, :, 0]
 
         # -----------------------------------------------------------------------------
         # Fill the output array based on the chosen mode.
@@ -471,10 +461,10 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                             output[out_base + 1] = gray
                             output[out_base + 2] = gray
 
-                # Alpha: use the provided alpha image if available; otherwise default to
-                # opaque.
+                # Alpha: use the provided alpha image if available; otherwise default
+                # to opaque.
                 if props.alpha_image is not None:
-                    alpha_data = get_channel_data(props.alpha_image, is_alpha=True)
+                    alpha_data = get_channel_data(props.alpha_image)
                     if alpha_data is None:
                         return {"CANCELLED"}
                     if np is not None:
@@ -484,6 +474,12 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                         for i in range(pixel_count):
                             src_idx = (i * channels_a) + channel_index
                             output[(i * 4) + 3] = alpha_pixels[src_idx]
+                else:
+                    if np is not None:
+                        output[:, :, 3] = 1.0
+                    else:
+                        for i in range(pixel_count):
+                            output[(i * 4) + 3] = 1.0
 
             else:  # MULTI mode: use separate images for each channel.
                 r_data = (
@@ -502,44 +498,41 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                     else None
                 )
                 a_data = (
-                    get_channel_data(props.a_image, is_alpha=True)
+                    get_channel_data(props.a_image)
                     if props.a_image is not None
                     else None
                 )
 
                 if np is not None:
-                    if r_data is not None:
-                        output[:, :, 0] = r_data
-                    if g_data is not None:
-                        output[:, :, 1] = g_data
-                    if b_data is not None:
-                        output[:, :, 2] = b_data
-                    if a_data is not None:
-                        output[:, :, 3] = a_data
+                    output[:, :, 0] = r_data if r_data is not None else 0.0
+                    output[:, :, 1] = g_data if g_data is not None else 0.0
+                    output[:, :, 2] = b_data if b_data is not None else 0.0
+                    output[:, :, 3] = a_data if a_data is not None else 1.0
                 else:
-                    if r_data is not None:
-                        r_pixels, channels_r, channel_index = r_data
-                        for i in range(pixel_count):
-                            output[(i * 4) + 0] = r_pixels[
-                                (i * channels_r) + channel_index
+                    for i in range(pixel_count):
+                        out_base = i * 4
+                        if r_data is not None:
+                            r_pixels, channels_r, ch_idx = r_data
+                            output[out_base + 0] = r_pixels[
+                                (i * channels_r) + ch_idx
                             ]
-                    if g_data is not None:
-                        g_pixels, channels_g, channel_index = g_data
-                        for i in range(pixel_count):
-                            output[(i * 4) + 1] = g_pixels[
-                                (i * channels_g) + channel_index
+                        if g_data is not None:
+                            g_pixels, channels_g, ch_idx = g_data
+                            output[out_base + 1] = g_pixels[
+                                (i * channels_g) + ch_idx
                             ]
-                    if b_data is not None:
-                        b_pixels, channels_b, channel_index = b_data
-                        for i in range(pixel_count):
-                            output[(i * 4) + 2] = b_pixels[
-                                (i * channels_b) + channel_index
+                        if b_data is not None:
+                            b_pixels, channels_b, ch_idx = b_data
+                            output[out_base + 2] = b_pixels[
+                                (i * channels_b) + ch_idx
                             ]
-                    if a_data is not None:
-                        a_pixels, channels_a, channel_index = a_data
-                        for i in range(pixel_count):
-                            src_idx = (i * channels_a) + channel_index
-                            output[(i * 4) + 3] = a_pixels[src_idx]
+                        if a_data is not None:
+                            a_pixels, channels_a, ch_idx = a_data
+                            output[out_base + 3] = a_pixels[
+                                (i * channels_a) + ch_idx
+                            ]
+                        else:
+                            output[out_base + 3] = 1.0
         finally:
             for tmp in temp_images:
                 if not tmp:
@@ -568,78 +561,27 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
             rgb_img.pixels = flat_pixels
             props.result_image = rgb_img
 
-            filepath = (
-                getattr(rgb_img, "filepath_raw", "")
-                or getattr(rgb_img, "filepath", "")
-                or ""
-            ).strip()
-            if filepath and Path(filepath).suffix:
-                filepath = bpy.path.abspath(filepath)
-                file_format = _image_file_format_from_path(filepath)
-                if file_format is not None:
-                    rgb_img.filepath_raw = filepath
-                    try:
-                        rgb_img.file_format = file_format
-                    except (AttributeError, TypeError):
-                        pass
-                    try:
-                        rgb_img.save()
-                        props.last_saved_path = filepath
-                    except RuntimeError as exc:
-                        self.report(
-                            {"WARNING"},
-                            (
-                                f"Packed, but could not overwrite source file: "
-                                f"{exc}"
-                            ),
-                        )
-                else:
-                    self.report(
-                        {"WARNING"},
-                        (
-                            "Source extension not supported for overwrite; "
-                            "saving a PNG copy instead."
-                        ),
-                    )
-            if not props.last_saved_path:
-                sources = [props.rgb_image, props.alpha_image]
-                base_target = _autosave_target_for_sources(sources)
-                base_target_path = Path(bpy.path.abspath(base_target))
-                out_dir = (
-                    base_target_path.parent
-                    if str(base_target_path.parent)
-                    else Path(".")
-                )
-                stem = base_target_path.stem or "ChannelPacked"
-                out_stem = (
-                    stem
-                    if stem == "ChannelPacked" or stem.endswith("_packed")
-                    else f"{stem}_packed"
-                )
-                out_path = _unique_path(out_dir / f"{out_stem}.png")
-
-                orig_filepath_raw = getattr(rgb_img, "filepath_raw", "")
-                orig_file_format = getattr(rgb_img, "file_format", None)
-                rgb_img.filepath_raw = str(out_path)
+            # If the RGB image is file-backed and is a PNG, overwrite it on disk.
+            filepath = getattr(rgb_img, "filepath_raw", "") or ""
+            if filepath.lower().endswith(".png"):
                 try:
                     rgb_img.file_format = "PNG"
                 except (AttributeError, TypeError):
                     pass
                 try:
                     rgb_img.save()
-                    props.last_saved_path = str(out_path)
+                    props.last_saved_path = bpy.path.abspath(filepath)
                 except RuntimeError as exc:
                     self.report(
                         {"WARNING"},
-                        f"Packed, but could not auto-save copy: {exc}",
+                        f"Packed, but could not overwrite PNG: {exc}",
                     )
-                finally:
-                    rgb_img.filepath_raw = orig_filepath_raw
-                    if orig_file_format is not None:
-                        try:
-                            rgb_img.file_format = orig_file_format
-                        except (AttributeError, TypeError):
-                            pass
+            else:
+                self.report(
+                    {"WARNING"},
+                    "Packed into the RGB image datablock, but did not auto-save "
+                    "(source is not a .png).",
+                )
         else:
             # -------------------------------------------------------------------------
             # Create a new image datablock for the packed result.
@@ -652,15 +594,25 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                 float_buffer=True,
             )
             result_img.pixels = flat_pixels
-            if mode == "SINGLE" and props.rgb_image is not None:
+            source_for_colorspace = None
+            if mode == "SINGLE":
+                source_for_colorspace = props.rgb_image
+            else:
+                source_for_colorspace = (
+                    props.r_image
+                    or props.g_image
+                    or props.b_image
+                    or props.a_image
+                )
+            if source_for_colorspace is not None:
                 try:
                     result_img.colorspace_settings.name = (
-                        props.rgb_image.colorspace_settings.name
+                        source_for_colorspace.colorspace_settings.name
                     )
                 except (AttributeError, TypeError):
                     pass
                 try:
-                    result_img.alpha_mode = props.rgb_image.alpha_mode
+                    result_img.alpha_mode = source_for_colorspace.alpha_mode
                 except (AttributeError, TypeError):
                     pass
             props.result_image = result_img
