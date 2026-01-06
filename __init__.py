@@ -18,6 +18,18 @@ from pathlib import Path
 import bpy
 
 
+_MULTI_SRGB_WRITE_MODE = "IDENTITY"
+_MULTI_SRGB_GAMMA = 1.2
+_MULTI_SRGB_CONTRAST = 0.985
+_MULTI_SRGB_BRIGHTNESS = 0.0
+
+
+def _is_srgb_colorspace(colorspace: str | None) -> bool:
+    if not colorspace:
+        return False
+    return colorspace.strip().lower() in {"srgb", "s-rgb"}
+
+
 def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     import binascii
     import struct
@@ -27,7 +39,14 @@ def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
     return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
 
 
-def _write_rgba_png8(path: Path, *, width: int, height: int, rgba_u8_bytes: bytes):
+def _write_rgba_png8(
+    path: Path,
+    *,
+    width: int,
+    height: int,
+    rgba_u8_bytes: bytes,
+    srgb: bool = True,
+):
     import struct
     import zlib
 
@@ -40,7 +59,7 @@ def _write_rgba_png8(path: Path, *, width: int, height: int, rgba_u8_bytes: byte
     for y in range(height):
         row_off = y * stride
         raw[row_off] = 0
-        src_off = y * width * 4
+        src_off = (height - 1 - y) * width * 4
         raw[row_off + 1 : row_off + 1 + width * 4] = rgba_u8_bytes[
             src_off : src_off + width * 4
         ]
@@ -50,6 +69,10 @@ def _write_rgba_png8(path: Path, *, width: int, height: int, rgba_u8_bytes: byte
     png = bytearray()
     png.extend(b"\x89PNG\r\n\x1a\n")
     png.extend(_png_chunk(b"IHDR", ihdr))
+    if srgb:
+        png.extend(_png_chunk(b"sRGB", b"\x00"))
+    else:
+        png.extend(_png_chunk(b"gAMA", struct.pack(">I", 100000)))
     png.extend(_png_chunk(b"IDAT", compressed))
     png.extend(_png_chunk(b"IEND", b""))
 
@@ -312,6 +335,42 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
         max=0.5,
     )
 
+    show_advanced: bpy.props.BoolProperty(
+        name="Advanced Options",
+        description="Show advanced output adjustments",
+        default=False,
+    )
+
+    multi_gamma: bpy.props.FloatProperty(
+        name="Gamma",
+        description="Separate Channels output gamma adjustment",
+        default=_MULTI_SRGB_GAMMA,
+        min=0.1,
+        soft_min=0.5,
+        soft_max=2.0,
+        max=4.0,
+    )
+
+    multi_contrast: bpy.props.FloatProperty(
+        name="Contrast",
+        description="Separate Channels output contrast (1.0 = no change)",
+        default=_MULTI_SRGB_CONTRAST,
+        min=0.0,
+        soft_min=0.9,
+        soft_max=1.1,
+        max=2.0,
+    )
+
+    multi_brightness: bpy.props.FloatProperty(
+        name="Brightness",
+        description="Separate Channels brightness offset",
+        default=_MULTI_SRGB_BRIGHTNESS,
+        min=-1.0,
+        soft_min=-0.2,
+        soft_max=0.2,
+        max=1.0,
+    )
+
 
 # -----------------------------------------------------------------------------
 # Operator: Pack Channels
@@ -451,6 +510,14 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
             x_idx = (np.arange(width) * (src_w / width)).astype(np.int32)
             return arr[y_idx[:, None], x_idx[None, :], :]
 
+        def _linear_to_srgb(x):
+            x = np.clip(x, 0.0, 1.0)
+            return np.where(
+                x <= 0.0031308,
+                x * 12.92,
+                1.055 * np.power(x, 1.0 / 2.4) - 0.055,
+            )
+
         def read_pixels_1d(img, *, treat_as_data: bool):
             ensure_image_pixels_loaded(img)
 
@@ -570,8 +637,6 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                 return None
 
             rgb = arr[:, :, 0]
-            if arr.shape[2] >= 3:
-                rgb = np.maximum(np.maximum(arr[:, :, 0], arr[:, :, 1]), arr[:, :, 2])
             if not prefer_alpha:
                 return rgb
 
@@ -621,31 +686,23 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
             else:
                 output[:, :, 3] = 1.0
         else:
-            arr_r = (
-                get_pixels_array(props.r_image, treat_as_data=False)
-                if props.r_image
-                else None
-            )
-            arr_g = (
-                get_pixels_array(props.g_image, treat_as_data=False)
-                if props.g_image
-                else None
-            )
-            arr_b = (
-                get_pixels_array(props.b_image, treat_as_data=False)
-                if props.b_image
-                else None
-            )
-            arr_a = (
-                get_pixels_array(props.a_image, treat_as_data=False)
-                if props.a_image
-                else None
-            )
+            def read_channel(img):
+                if img is None:
+                    return None, None
+                try:
+                    cs = img.colorspace_settings.name
+                except Exception:
+                    cs = None
+                arr = get_pixels_array(img, treat_as_data=False)
+                if arr is None:
+                    return None, cs
+                data = extract_greyscale(arr, prefer_alpha=True)
+                return data, cs
 
-            r_data = extract_greyscale(arr_r, prefer_alpha=True)
-            g_data = extract_greyscale(arr_g, prefer_alpha=True)
-            b_data = extract_greyscale(arr_b, prefer_alpha=True)
-            a_data = extract_greyscale(arr_a, prefer_alpha=True)
+            r_data, r_cs = read_channel(props.r_image)
+            g_data, g_cs = read_channel(props.g_image)
+            b_data, b_cs = read_channel(props.b_image)
+            a_data, a_cs = read_channel(props.a_image)
 
             output[:, :, 0] = r_data if r_data is not None else 0.0
             output[:, :, 1] = g_data if g_data is not None else 0.0
@@ -666,6 +723,10 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
             props.debug_info = (
                 f"R[{_mm(r_data)}] G[{_mm(g_data)}] B[{_mm(b_data)}] "
                 f"A[{_mm(a_data)}]"
+            )
+            props.debug_info = (
+                f"{props.debug_info} "
+                f"INCS[{r_cs},{g_cs},{b_cs},{a_cs}]"
             )
 
         flat_pixels = output.astype(np.float32, copy=False).reshape(-1).tolist()
@@ -754,14 +815,52 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                 out_stem = f"{stem}_packed"
 
             out_path = _unique_path(out_dir / f"{out_stem}.png")
-            rgb_lin = np.clip(output[:, :, 0:3], 0.0, 1.0)
-            rgb_srgb = np.where(
-                rgb_lin <= 0.0031308,
-                rgb_lin * 12.92,
-                1.055 * np.power(rgb_lin, 1.0 / 2.4) - 0.055,
+            if (
+                _is_srgb_colorspace(r_cs)
+                and _is_srgb_colorspace(g_cs)
+                and _is_srgb_colorspace(b_cs)
+            ):
+                out_cs = "sRGB"
+            else:
+                out_cs = "Non-Color"
+
+            fit_ref = None
+            srgb_write_mode = "-"
+
+            multi_gamma = float(getattr(props, "multi_gamma", _MULTI_SRGB_GAMMA))
+            if multi_gamma <= 0.0:
+                multi_gamma = 1.0
+            multi_contrast = float(
+                getattr(props, "multi_contrast", _MULTI_SRGB_CONTRAST)
             )
+            multi_brightness = float(
+                getattr(props, "multi_brightness", _MULTI_SRGB_BRIGHTNESS)
+            )
+            eff_gamma = 1.0
+
+            def _choose_multi_srgb_write_mode() -> str:
+                return _MULTI_SRGB_WRITE_MODE
+
+            if out_cs == "sRGB":
+                srgb_write_mode = _choose_multi_srgb_write_mode()
+
+            if out_cs == "sRGB":
+                eff_gamma = float(multi_gamma)
+
             encoded = output.copy()
-            encoded[:, :, 0:3] = rgb_srgb
+            if out_cs == "sRGB":
+                rgb = np.clip(encoded[:, :, 0:3], 0.0, 1.0)
+                if abs(eff_gamma - 1.0) > 1e-6:
+                    rgb = np.power(rgb, eff_gamma)
+                if abs(multi_contrast - 1.0) > 1e-9:
+                    rgb = (rgb - 0.5) * multi_contrast + 0.5
+                if abs(multi_brightness) > 1e-9:
+                    rgb = rgb + multi_brightness
+                rgb = np.clip(rgb, 0.0, 1.0)
+                if srgb_write_mode == "ENCODE":
+                    rgb = _linear_to_srgb(rgb)
+                encoded[:, :, 0:3] = rgb
+
             rgba_u8 = np.clip(encoded * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
             u8_mins, u8_maxs = _u8_rgba_minmax(rgba_u8)
             try:
@@ -770,6 +869,7 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                     width=width,
                     height=height,
                     rgba_u8_bytes=rgba_u8.tobytes(order="C"),
+                    srgb=out_cs == "sRGB",
                 )
             except Exception as exc:
                 self.report({"ERROR"}, f"Could not write PNG: {exc}")
@@ -792,32 +892,31 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                 result_img.use_view_as_render = False
             except Exception:
                 pass
-            source_cs = None
-            for src in sources:
-                if src is None:
-                    continue
-                try:
-                    source_cs = src.colorspace_settings.name
-                except Exception:
-                    source_cs = None
-                if source_cs:
-                    break
-            if source_cs:
-                try:
-                    result_img.colorspace_settings.name = source_cs
-                except Exception:
-                    pass
+            try:
+                result_img.colorspace_settings.name = out_cs
+            except Exception:
+                pass
+
             ensure_image_pixels_loaded(result_img)
             file_minmax = _readback_minmax(result_img)
             file_mins, file_maxs = (None, None)
             if file_minmax is not None:
                 file_mins, file_maxs = file_minmax
+
             props.result_image = result_img
             props.last_saved_path = str(out_path)
+            try:
+                cs_name = result_img.colorspace_settings.name
+            except Exception:
+                cs_name = "?"
+            fit_str = "-"
             props.debug_info = (
                 f"{props.debug_info} OUT[{out_mins},{out_maxs}] "
                 f"U8[{u8_mins},{u8_maxs}] "
-                f"FILE[{file_mins},{file_maxs}] WRITE[file] SET[PYPNG]"
+                f"FILE[{file_mins},{file_maxs}] CS[{cs_name}] "
+                f"{fit_str} EFFG[{eff_gamma:.4f}] "
+                f"CONT[{multi_contrast:.4f}] BRIT[{multi_brightness:.4f}] "
+                f"ENC[{srgb_write_mode}] WRITE[file] SET[PYPNG]"
             ).strip()
             _set_active_image_in_image_editor(context, props.result_image)
             self.report({"INFO"}, f"Channel packing complete. Saved: {out_path}")
@@ -1229,6 +1328,25 @@ class ChannelPackerPTPanel(bpy.types.Panel):
             debug_row = result_box.row()
             debug_row.enabled = False
             debug_row.prop(props, "debug_info", text="Debug")
+
+        layout.separator()
+        layout.separator()
+
+        adv_box = layout.box()
+        header = adv_box.row(align=True)
+        header.prop(
+            props,
+            "show_advanced",
+            text="Advanced Options",
+            icon="TRIA_DOWN" if props.show_advanced else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if props.show_advanced:
+            col = adv_box.column(align=True)
+            col.enabled = props.mode == "MULTI"
+            col.prop(props, "multi_gamma")
+            col.prop(props, "multi_contrast")
+            col.prop(props, "multi_brightness")
 
 
 # -----------------------------------------------------------------------------
