@@ -7,7 +7,7 @@ maintainer = "Beyond Dev (Tyler Walker)"
 type = "add-on"
 blender_version_min = "4.2.0"
 blender_version_max = "5.0.999"
-license = ["SPDX:GPL-2.0-or-later"]
+license = ["SPDX:GPL-3.0-or-later"]
 website = "https://github.com/tdw46/BeyondChannelPacker/issues"
 
 tags = ["Image"]
@@ -15,6 +15,7 @@ tags = ["Image"]
 [build]
 paths_exclude_pattern = [
   "__pycache__/",
+  ".ruff_cache/",
   ".mypy_cache/",
   "/.git/",
   "/.github/",
