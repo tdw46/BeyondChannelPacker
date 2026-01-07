@@ -181,3 +181,23 @@ readback stayed at defaults), MULTI now:
 - Encodes RGB as sRGB when writing the PNG (linear → sRGB transfer), leaving
   alpha unmodified (straight alpha). This aims to match SINGLE mode’s “looks
   correct when viewed as sRGB” behavior.
+
+## Jan 2026 Follow-Up: Back To Blender Writes (SINGLE-style)
+
+To match SINGLE mode more closely (and avoid PNG-tag/transfer-function quirks),
+MULTI now uses the same Blender image datablock write path as SINGLE:
+
+- Pack in numpy to an RGBA float buffer (`output`) at the target size.
+- Apply optional MULTI adjustments (gamma/contrast/brightness) in linear space.
+- Create a safe writable RGBA target datablock via the “generated RGBA → copy”
+  mitigation (avoids the all-black write failures seen with some freshly
+  created datablocks in Blender 5.0).
+- Write pixels via `pixels.foreach_set()` (fallback to slice assignment), then
+  `update()`/`update_tag()`.
+- Auto-save via `image.save()` and show the datablock in the Image Editor.
+
+## Jan 2026 Follow-Up: Automatic Fallback To Pure-Python PNG
+
+(Removed) The user explicitly disallowed any pure-Python PNG fallback. This
+section remains only as a record of a previously attempted mitigation and is
+not active in the add-on.
