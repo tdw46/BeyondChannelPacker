@@ -1,16 +1,16 @@
 schema_version = "1.0.0"
 id = "beyond_channel_packer"
-version = "0.1.6"
-name = "BeyondChannelPacker"
-tagline = "Channel pack images in the Image Editor (choose RGB+Alpha or 4 separate channels)."
+version = "1.0.0"
+name = "Beyond Channel Packer"
+tagline = "Pack image channels (RGBA) in the Image Editor"
 maintainer = "Beyond Dev (Tyler Walker)"
 type = "add-on"
 blender_version_min = "4.2.0"
-blender_version_max = "5.0.999"
+blender_version_max = "5.9.999"
 license = ["SPDX:GPL-3.0-or-later"]
 website = "https://github.com/tdw46/BeyondChannelPacker/issues"
 
-tags = ["Image"]
+tags = ["UV", "Paint"]
 
 [build]
 paths_exclude_pattern = [

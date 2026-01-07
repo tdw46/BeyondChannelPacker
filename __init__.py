@@ -23,9 +23,9 @@ _MULTI_SRGB_CONTRAST = 1.0
 _MULTI_SRGB_BRIGHTNESS = 0.0
 
 bl_info = {
-    "name": "BeyondChannelPacker",
+    "name": "Beyond Channel Packer",
     "author": "Beyond Dev (Tyler Walker)",
-    "version": (0, 1, 5),
+    "version": (1, 0, 0),
     "blender": (4, 2, 0),
     "description": (
         "Channel pack images in the Image Editor (choose RGB+Alpha or 4 separate "
@@ -1713,15 +1713,24 @@ classes = (
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    # Be tolerant of reloads where the property may already exist.
+    if hasattr(bpy.types.Scene, "beyond_channel_packer"):
+        del bpy.types.Scene.beyond_channel_packer
     bpy.types.Scene.beyond_channel_packer = bpy.props.PointerProperty(
         type=BeyondChannelPackerProperties
     )
 
 
 def unregister():
+    # Be tolerant of partial registrations or reloads.
+    if hasattr(bpy.types.Scene, "beyond_channel_packer"):
+        del bpy.types.Scene.beyond_channel_packer
+
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
-    del bpy.types.Scene.beyond_channel_packer
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass
 
 
 if __name__ == "__main__":
