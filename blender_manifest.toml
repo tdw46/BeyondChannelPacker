@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "beyond_channel_packer"
-version = "1.0.0"
+version = "1.0.1"
 name = "Beyond Channel Packer"
 tagline = "Pack image channels (RGBA) in the Image Editor"
 maintainer = "Beyond Dev (Tyler Walker)"
@@ -21,6 +21,9 @@ paths_exclude_pattern = [
   "/.github/",
   ".gitignore",
   ".gitattributes",
+  "README.md",
+  "panel_image.png",
+  "ruff.toml",
   "*.pyc",
   "*.pyo",
   "*.pyd",
