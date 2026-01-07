@@ -18,8 +18,8 @@ from pathlib import Path
 import bpy
 
 
-_MULTI_SRGB_GAMMA = 1.2
-_MULTI_SRGB_CONTRAST = 0.985
+_MULTI_SRGB_GAMMA = 1.0
+_MULTI_SRGB_CONTRAST = 1.0
 _MULTI_SRGB_BRIGHTNESS = 0.0
 
 bl_info = {
@@ -632,12 +632,6 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
         default="",
     )
 
-    debug_info: bpy.props.StringProperty(
-        name="Debug Info",
-        description="Last debug info from packing",
-        default="",
-    )
-
     save_path_single: bpy.props.StringProperty(
         name="Save To",
         description="Base save target path for RGB + Alpha",
@@ -692,9 +686,9 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
         name="Aspect Tolerance",
         description=(
             "Allowed relative aspect ratio difference for auto scaling "
-            "(e.g. 0.02 = 2%)"
+            "(e.g. 0.20 = 20%)"
         ),
-        default=0.02,
+        default=0.20,
         min=0.0,
         soft_max=0.1,
         max=0.5,
@@ -751,7 +745,6 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
         props = context.scene.beyond_channel_packer
         mode = props.mode
         props.last_saved_path = ""
-        props.debug_info = ""
         _ensure_default_save_paths(props)
 
         # -----------------------------------------------------------------------------
@@ -786,7 +779,6 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                 pass
 
         missing_sources: list[str] = []
-        cached_missing: list[str] = []
         for img in selected_images:
             if img is None:
                 continue
@@ -805,29 +797,19 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
             if exists:
                 continue
             try:
-                has_data = bool(getattr(img, "has_data", False))
-            except Exception:
-                has_data = False
-            try:
                 packed = bool(getattr(img, "packed_file", None))
             except Exception:
                 packed = False
             if packed:
                 continue
-            if has_data:
-                cached_missing.append(abs_path)
-            else:
-                missing_sources.append(abs_path)
+            missing_sources.append(abs_path)
 
         if missing_sources:
             self.report(
                 {"ERROR"},
                 "Source image(s) missing on disk. Reload or re-link and try again.",
             )
-            props.debug_info = f"MISSING[{len(missing_sources)}]"
             return {"CANCELLED"}
-        if cached_missing:
-            props.debug_info = f"MISSING_CACHED[{len(cached_missing)}]"
 
         # For SINGLE mode, the RGB image is required.
         if mode == "SINGLE":
@@ -917,14 +899,6 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
             y_idx = (np.arange(height) * (src_h / height)).astype(np.int32)
             x_idx = (np.arange(width) * (src_w / width)).astype(np.int32)
             return arr[y_idx[:, None], x_idx[None, :], :]
-
-        def _linear_to_srgb(x):
-            x = np.clip(x, 0.0, 1.0)
-            return np.where(
-                x <= 0.0031308,
-                x * 12.92,
-                1.055 * np.power(x, 1.0 / 2.4) - 0.055,
-            )
 
         def read_pixels_1d(img, *, treat_as_data: bool):
             ensure_image_pixels_loaded(img)
@@ -1058,25 +1032,6 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                 return alpha
             return rgb
 
-        def _debug_image_stats(label: str, img, data):
-            if data is None:
-                print(f"[BeyondChannelPacker] {label}: <no data>")
-                return
-            try:
-                fp = getattr(img, "filepath", "")
-            except Exception:
-                fp = ""
-            print(
-                "[BeyondChannelPacker]",
-                label,
-                "min/max",
-                float(np.min(data)),
-                float(np.max(data)),
-                "img",
-                getattr(img, "name", "<none>"),
-                fp,
-            )
-
         if mode == "SINGLE":
             arr_rgb = get_pixels_array(props.rgb_image, treat_as_data=False)
             if arr_rgb is None:
@@ -1096,46 +1051,22 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
         else:
             def read_channel(img):
                 if img is None:
-                    return None, None
-                try:
-                    cs = img.colorspace_settings.name
-                except Exception:
-                    cs = None
+                    return None
                 arr = get_pixels_array(img, treat_as_data=False)
                 if arr is None:
-                    return None, cs
+                    return None
                 data = extract_greyscale(arr, prefer_alpha=True)
-                return data, cs
+                return data
 
-            r_data, r_cs = read_channel(props.r_image)
-            g_data, g_cs = read_channel(props.g_image)
-            b_data, b_cs = read_channel(props.b_image)
-            a_data, a_cs = read_channel(props.a_image)
+            r_data = read_channel(props.r_image)
+            g_data = read_channel(props.g_image)
+            b_data = read_channel(props.b_image)
+            a_data = read_channel(props.a_image)
 
             output[:, :, 0] = r_data if r_data is not None else 0.0
             output[:, :, 1] = g_data if g_data is not None else 0.0
             output[:, :, 2] = b_data if b_data is not None else 0.0
             output[:, :, 3] = a_data if a_data is not None else 1.0
-
-            if float(output[:, :, 0:3].max()) <= 1e-6:
-                _debug_image_stats("MULTI R", props.r_image, r_data)
-                _debug_image_stats("MULTI G", props.g_image, g_data)
-                _debug_image_stats("MULTI B", props.b_image, b_data)
-                _debug_image_stats("MULTI A", props.a_image, a_data)
-
-            def _mm(x):
-                if x is None:
-                    return "None"
-                return f"{float(np.min(x)):.4f},{float(np.max(x)):.4f}"
-
-            props.debug_info = (
-                f"R[{_mm(r_data)}] G[{_mm(g_data)}] B[{_mm(b_data)}] "
-                f"A[{_mm(a_data)}]"
-            )
-            props.debug_info = (
-                f"{props.debug_info} "
-                f"INCS[{r_cs},{g_cs},{b_cs},{a_cs}]"
-            )
 
             multi_gamma = float(getattr(props, "multi_gamma", _MULTI_SRGB_GAMMA))
             if multi_gamma <= 0.0:
@@ -1156,37 +1087,8 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                 rgb = rgb + multi_brightness
             output[:, :, 0:3] = np.clip(rgb, 0.0, 1.0)
 
-            props.debug_info = (
-                f"{props.debug_info} "
-                f"ADJ[G{multi_gamma:.4f},C{multi_contrast:.4f},B{multi_brightness:.4f}]"
-            )
 
         flat_pixels = output.astype(np.float32, copy=False).reshape(-1).tolist()
-        out_mins = tuple(float(v) for v in np.min(output, axis=(0, 1)))
-        out_maxs = tuple(float(v) for v in np.max(output, axis=(0, 1)))
-
-        def _readback_minmax(img):
-            try:
-                px_len = len(img.pixels)
-            except Exception:
-                return None
-            if px_len <= 0:
-                return None
-            rb = np.empty(px_len, dtype=np.float32)
-            try:
-                img.pixels.foreach_get(rb)
-            except Exception:
-                try:
-                    rb = np.array(img.pixels[:], dtype=np.float32)
-                except Exception:
-                    return None
-            if rb.size < 4:
-                return None
-            rb = rb.reshape((-1, 4))
-            mins = np.min(rb, axis=0)
-            maxs = np.max(rb, axis=0)
-            return tuple(float(v) for v in mins), tuple(float(v) for v in maxs)
-
         def assign_pixels(img, pixels_list) -> str:
             from array import array
 
@@ -1386,38 +1288,14 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                 pass
 
         set_status = assign_pixels(result_img, flat_pixels)
+        if set_status.startswith("ERR:"):
+            self.report({"ERROR"}, f"Could not write packed pixels: {set_status}")
+            return {"CANCELLED"}
         props.result_image = result_img
         try:
             props.result_image.update()
         except Exception:
             pass
-
-        rb = _readback_minmax(props.result_image)
-        try:
-            alpha_mode_dbg = props.result_image.alpha_mode
-        except Exception:
-            alpha_mode_dbg = "?"
-        try:
-            px_len_dbg = len(props.result_image.pixels)
-        except Exception:
-            px_len_dbg = -1
-        try:
-            is_float_dbg = bool(getattr(props.result_image, "is_float", False))
-        except Exception:
-            is_float_dbg = False
-        buf_dbg = f"BUF[len={px_len_dbg},float={is_float_dbg}]"
-        if rb is not None:
-            rb_mins, rb_maxs = rb
-            props.debug_info = (
-                f"{props.debug_info} OUT[{out_mins},{out_maxs}] "
-                f"WRITE[{rb_mins},{rb_maxs}] SET[{set_status}] {buf_dbg}"
-            ).strip()
-        else:
-            props.debug_info = (
-                f"{props.debug_info} OUT[{out_mins},{out_maxs}] "
-                f"WRITE[?] SET[{set_status}] {buf_dbg}"
-            ).strip()
-        props.debug_info = f"{props.debug_info} AM[{alpha_mode_dbg}]".strip()
 
         props.result_image.filepath_raw = str(out_path)
         try:
@@ -1459,7 +1337,6 @@ class ChannelPackerOTSplitChannels(bpy.types.Operator):
     def execute(self, context):
         props = context.scene.beyond_channel_packer
         props.last_saved_path = ""
-        props.debug_info = ""
         _ensure_default_save_paths(props)
 
         src_img = props.split_image
@@ -1653,10 +1530,6 @@ class ChannelPackerOTSplitChannels(bpy.types.Operator):
             if saved_paths:
                 props.last_saved_path = str(saved_paths[-1])
 
-            props.debug_info = (
-                f"SPLIT[{channels}] OUT[{width}x{height}] "
-                f"SAVED[{len(saved_paths)}] BASE[{base_path}]"
-            )
         except RuntimeError as exc:
             self.report({"ERROR"}, f"Could not save split channels: {exc}")
             return {"CANCELLED"}
@@ -1710,36 +1583,6 @@ class ChannelPackerOTLoadImage(bpy.types.Operator):
             return {"CANCELLED"}
 
         setattr(props, self.target_prop, img)
-        return {"FINISHED"}
-
-
-class ChannelPackerOTCopyDebug(bpy.types.Operator):
-    bl_idname = "channelpacker.copy_debug"
-    bl_label = "Copy Debug"
-    bl_description = "Copy the debug info text to the clipboard"
-
-    def execute(self, context):
-        props = context.scene.beyond_channel_packer
-        text = props.debug_info or ""
-        try:
-            context.window_manager.clipboard = text
-        except Exception:
-            return {"CANCELLED"}
-        return {"FINISHED"}
-
-
-class ChannelPackerOTCopySavedPath(bpy.types.Operator):
-    bl_idname = "channelpacker.copy_saved_path"
-    bl_label = "Copy Saved Path"
-    bl_description = "Copy the last saved path to the clipboard"
-
-    def execute(self, context):
-        props = context.scene.beyond_channel_packer
-        text = props.last_saved_path or ""
-        try:
-            context.window_manager.clipboard = text
-        except Exception:
-            return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -1875,16 +1718,6 @@ class ChannelPackerPTPanel(bpy.types.Panel):
             adjust_col.prop(props, "multi_contrast")
             adjust_col.prop(props, "multi_brightness")
 
-            if props.debug_info:
-                adv_box.separator()
-                debug_row = adv_box.row(align=True)
-                debug_row.prop(props, "debug_info", text="Debug")
-                debug_row.operator(
-                    "channelpacker.copy_debug",
-                    text="",
-                    icon="COPYDOWN",
-                )
-
 
 # -----------------------------------------------------------------------------
 # Registration
@@ -1894,8 +1727,6 @@ classes = (
     ChannelPackerOTPackChannels,
     ChannelPackerOTSplitChannels,
     ChannelPackerOTLoadImage,
-    ChannelPackerOTCopyDebug,
-    ChannelPackerOTCopySavedPath,
     ChannelPackerPTPanel,
 )
 
