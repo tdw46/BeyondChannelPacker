@@ -331,9 +331,9 @@ def _find_image_by_abspath(blend_data, abs_path: str):
     return None
 
 
-def _ensure_pixels_loaded(img) -> None:
+def _ensure_pixels_loaded(img) -> bool:
     if img is None:
-        return
+        return False
     try:
         if getattr(img, "source", "") == "FILE" and not getattr(img, "has_data", True):
             img.reload()
@@ -342,7 +342,8 @@ def _ensure_pixels_loaded(img) -> None:
     try:
         _ = img.pixels[0]
     except Exception:
-        pass
+        return False
+    return True
 
 
 # -----------------------------------------------------------------------------
@@ -878,21 +879,6 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
         output = np.zeros((height, width, 4), dtype=np.float32)
         output[:, :, 3] = 1.0
 
-        def ensure_image_pixels_loaded(img) -> None:
-            if img is None:
-                return
-            try:
-                if getattr(img, "source", "") == "FILE" and not getattr(
-                    img, "has_data", True
-                ):
-                    img.reload()
-            except RuntimeError:
-                pass
-            try:
-                _ = img.pixels[0]
-            except Exception:
-                pass
-
         def _resample_nearest(arr, src_w: int, src_h: int):
             if src_w == width and src_h == height:
                 return arr
@@ -901,7 +887,7 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
             return arr[y_idx[:, None], x_idx[None, :], :]
 
         def read_pixels_1d(img, *, treat_as_data: bool):
-            ensure_image_pixels_loaded(img)
+            _ensure_pixels_loaded(img)
 
             orig_colorspace = None
             orig_alpha_mode = None
@@ -1129,17 +1115,6 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
         # -------------------------------------------------------------------------
         # Create/update the packed result image and save it.
         # -------------------------------------------------------------------------
-        source_for_colorspace = None
-        if mode == "SINGLE":
-            source_for_colorspace = props.rgb_image
-        else:
-            source_for_colorspace = (
-                props.r_image
-                or props.g_image
-                or props.b_image
-                or props.a_image
-            )
-
         sources = (
             [props.rgb_image, props.alpha_image]
             if mode == "SINGLE"
@@ -1187,31 +1162,6 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                     base_img = None
 
         if base_img is None:
-            if mode == "MULTI":
-                for src in sources:
-                    fp = _image_abspath(src)
-                    if not fp:
-                        continue
-                    try:
-                        base_img = context.blend_data.images.load(
-                            fp,
-                            check_existing=False,
-                        )
-                    except Exception:
-                        base_img = None
-                    if base_img is None:
-                        continue
-                    try:
-                        base_img.name = base_name
-                    except Exception:
-                        pass
-                    try:
-                        base_img.filepath_raw = str(out_path)
-                    except Exception:
-                        pass
-                    break
-
-        if base_img is None:
             result_img = context.blend_data.images.new(
                 name=_unique_image_name(context.blend_data, base_name),
                 width=width,
@@ -1231,37 +1181,51 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
         except Exception:
             pass
         if int(result_img.size[0]) != width or int(result_img.size[1]) != height:
+            desired_path = str(out_path)
+            original_colorspace = None
+            original_alpha_mode = None
             try:
-                if getattr(result_img, "source", "") == "FILE" and not getattr(
-                    result_img,
-                    "has_data",
-                    True,
-                ):
-                    fallback = None
-                    for src in sources:
-                        fp = _image_abspath(src)
-                        if not fp:
-                            continue
-                        try:
-                            if Path(fp).exists():
-                                fallback = fp
-                                break
-                        except Exception:
+                original_colorspace = result_img.colorspace_settings.name
+            except Exception:
+                original_colorspace = None
+            try:
+                original_alpha_mode = result_img.alpha_mode
+            except Exception:
+                original_alpha_mode = None
+
+            try:
+                needs_fallback = bool(
+                    getattr(result_img, "source", "") == "FILE"
+                    and not getattr(result_img, "has_data", True)
+                )
+            except Exception:
+                needs_fallback = False
+
+            fallback = None
+            if needs_fallback:
+                for src in sources:
+                    fp = _image_abspath(src)
+                    if not fp:
+                        continue
+                    try:
+                        if Path(fp).exists():
                             fallback = fp
                             break
-                    if fallback:
-                        try:
-                            result_img.filepath_raw = fallback
-                        except Exception:
-                            fallback = None
-                    if fallback:
-                        try:
-                            result_img.reload()
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-            ensure_image_pixels_loaded(result_img)
+                    except Exception:
+                        fallback = fp
+                        break
+                if fallback:
+                    try:
+                        result_img.filepath_raw = fallback
+                    except Exception:
+                        fallback = None
+                if fallback:
+                    try:
+                        result_img.reload()
+                    except Exception:
+                        pass
+
+            _ensure_pixels_loaded(result_img)
             try:
                 result_img.scale(width, height)
             except Exception as exc:
@@ -1270,6 +1234,20 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                     f"Could not scale result image '{result_img.name}': {exc}",
                 )
                 return {"CANCELLED"}
+            try:
+                result_img.filepath_raw = desired_path
+            except Exception:
+                pass
+            try:
+                if original_colorspace is not None:
+                    result_img.colorspace_settings.name = original_colorspace
+            except Exception:
+                pass
+            try:
+                if original_alpha_mode is not None:
+                    result_img.alpha_mode = original_alpha_mode
+            except Exception:
+                pass
 
         try:
             result_img.use_view_as_render = False
@@ -1279,13 +1257,10 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
             result_img.alpha_mode = "STRAIGHT"
         except Exception:
             pass
-        if source_for_colorspace is not None:
-            try:
-                result_img.colorspace_settings.name = (
-                    source_for_colorspace.colorspace_settings.name
-                )
-            except Exception:
-                pass
+        try:
+            result_img.colorspace_settings.name = "sRGB"
+        except Exception:
+            pass
 
         set_status = assign_pixels(result_img, flat_pixels)
         if set_status.startswith("ERR:"):
@@ -1304,9 +1279,13 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
             pass
         try:
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            props.result_image.save()
+            props.result_image.save(filepath=str(out_path), save_copy=False)
             if not out_path.exists():
                 raise RuntimeError("File was not written to disk.")
+            try:
+                props.result_image.filepath = str(out_path)
+            except Exception:
+                pass
             props.last_saved_path = str(out_path)
         except RuntimeError as exc:
             self.report({"ERROR"}, f"Packed, but could not save result: {exc}")
