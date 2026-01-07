@@ -41,6 +41,38 @@ bl_info = {
 _DEFAULT_SAVE_PATH_SCENES_PENDING: set[str] = set()
 
 
+def _needs_default_save_paths(props) -> bool:
+    if props is None:
+        return False
+    if (getattr(props, "save_path_single", "") or "").strip() == "" and props.rgb_image:
+        return True
+    if (getattr(props, "save_path_multi", "") or "").strip() == "" and props.r_image:
+        return True
+    if (
+        (getattr(props, "save_path_split", "") or "").strip() == ""
+        and props.split_image
+    ):
+        return True
+    if props.split_image:
+        if not getattr(props, "split_name_r_is_custom", False) and not (
+            getattr(props, "split_name_r", "") or ""
+        ).strip():
+            return True
+        if not getattr(props, "split_name_g_is_custom", False) and not (
+            getattr(props, "split_name_g", "") or ""
+        ).strip():
+            return True
+        if not getattr(props, "split_name_b_is_custom", False) and not (
+            getattr(props, "split_name_b", "") or ""
+        ).strip():
+            return True
+        if not getattr(props, "split_name_a_is_custom", False) and not (
+            getattr(props, "split_name_a", "") or ""
+        ).strip():
+            return True
+    return False
+
+
 def _schedule_default_save_paths(scene) -> None:
     if scene is None:
         return
@@ -61,6 +93,8 @@ def _schedule_default_save_paths(scene) -> None:
                 return None
             props = getattr(scn, "beyond_channel_packer", None)
             if props is None:
+                return None
+            if not _needs_default_save_paths(props):
                 return None
             _ensure_default_save_paths(props)
             return None
@@ -147,6 +181,39 @@ def _autosave_target_for_sources(source_images):
     return str(Path(bpy.app.tempdir or ".") / "ChannelPacked.png")
 
 
+def _autosave_packed_target_for_sources(source_images) -> str:
+    for img in source_images:
+        if img is None:
+            continue
+        filepath = (
+            getattr(img, "filepath_raw", "") or getattr(img, "filepath", "") or ""
+        ).strip()
+        if not filepath:
+            continue
+        filepath = bpy.path.abspath(filepath)
+        src_path = Path(filepath)
+        suffix = src_path.suffix
+        if not suffix:
+            continue
+        return str(src_path.with_name(f"{src_path.stem}_packed{suffix}"))
+
+    blend_dir = bpy.path.abspath("//")
+    if blend_dir:
+        return str(Path(blend_dir) / "ChannelPacked.png")
+    return str(Path(bpy.app.tempdir or ".") / "ChannelPacked.png")
+
+
+def _result_image_base_name(*, mode: str, base_stem: str) -> str:
+    stem = (base_stem or "").strip() or "ChannelPacked"
+    if stem != "ChannelPacked":
+        return stem
+    if mode == "SINGLE":
+        return "ChannelPacked_RGB_A"
+    if mode == "MULTI":
+        return "ChannelPacked_4CH"
+    return stem
+
+
 def _autosave_format_for_path(filepath: str) -> tuple[str, str]:
     ext = Path(filepath).suffix.lower() if filepath else ""
     if ext == ".exr":
@@ -165,7 +232,7 @@ def _resolve_save_target_path(
     override_existing: bool,
 ) -> tuple[Path, str]:
     base = (base_path or "").strip()
-    base_target = base if base else _autosave_target_for_sources(sources)
+    base_target = base if base else _autosave_packed_target_for_sources(sources)
 
     base_path = Path(bpy.path.abspath(base_target))
     file_format, ext = _autosave_format_for_path(str(base_path))
@@ -197,6 +264,26 @@ def _mark_save_multi_custom(self, _context):
     self.save_path_multi_is_custom = bool((self.save_path_multi or "").strip())
 
 
+def _mark_save_split_custom(self, _context):
+    self.save_path_split_is_custom = bool((self.save_path_split or "").strip())
+
+
+def _mark_split_name_r_custom(self, _context):
+    self.split_name_r_is_custom = bool((self.split_name_r or "").strip())
+
+
+def _mark_split_name_g_custom(self, _context):
+    self.split_name_g_is_custom = bool((self.split_name_g or "").strip())
+
+
+def _mark_split_name_b_custom(self, _context):
+    self.split_name_b_is_custom = bool((self.split_name_b or "").strip())
+
+
+def _mark_split_name_a_custom(self, _context):
+    self.split_name_a_is_custom = bool((self.split_name_a or "").strip())
+
+
 def _unique_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -215,6 +302,47 @@ def _unique_image_name(blend_data, base_name: str) -> str:
         if candidate not in blend_data.images:
             return candidate
     return base_name
+
+
+def _image_abspath(img) -> str | None:
+    if img is None:
+        return None
+    filepath = (
+        getattr(img, "filepath_raw", "") or getattr(img, "filepath", "") or ""
+    ).strip()
+    if not filepath:
+        return None
+    try:
+        return bpy.path.abspath(filepath)
+    except Exception:
+        return filepath
+
+
+def _find_image_by_abspath(blend_data, abs_path: str):
+    if not abs_path:
+        return None
+    for img in blend_data.images:
+        try:
+            existing = _image_abspath(img)
+        except Exception:
+            existing = None
+        if existing and existing == abs_path:
+            return img
+    return None
+
+
+def _ensure_pixels_loaded(img) -> None:
+    if img is None:
+        return
+    try:
+        if getattr(img, "source", "") == "FILE" and not getattr(img, "has_data", True):
+            img.reload()
+    except Exception:
+        pass
+    try:
+        _ = img.pixels[0]
+    except Exception:
+        pass
 
 
 # -----------------------------------------------------------------------------
@@ -237,32 +365,64 @@ def image_update_callback(prop_name):
                     or getattr(img, "filepath", "")
                     or ""
                 ).strip()
-                if not fp:
-                    return
-                fp = bpy.path.abspath(fp)
-                src_path = Path(fp)
-                if src_path.suffix:
-                    packed_path = src_path.with_name(
-                        f"{src_path.stem}_packed{src_path.suffix}"
-                    )
-                else:
-                    packed_path = src_path.with_name(f"{src_path.name}_packed.png")
+                src_path = None
+                if fp:
+                    fp = bpy.path.abspath(fp)
+                    src_path = Path(fp)
+                    if src_path.suffix:
+                        packed_path = src_path.with_name(
+                            f"{src_path.stem}_packed{src_path.suffix}"
+                        )
+                    else:
+                        packed_path = src_path.with_name(
+                            f"{src_path.name}_packed.png"
+                        )
 
                 if prop_name == "rgb_image":
-                    if not getattr(self, "save_path_single_is_custom", False):
+                    if src_path is not None and not getattr(
+                        self, "save_path_single_is_custom", False
+                    ):
                         self.save_path_single = str(packed_path)
                         self.save_path_single_is_custom = False
                 if prop_name == "r_image":
-                    if not getattr(self, "save_path_multi_is_custom", False):
+                    if src_path is not None and not getattr(
+                        self, "save_path_multi_is_custom", False
+                    ):
                         self.save_path_multi = str(packed_path)
                         self.save_path_multi_is_custom = False
+                if prop_name == "split_image":
+                    if not getattr(self, "save_path_split_is_custom", False):
+                        if src_path is not None:
+                            if src_path.suffix:
+                                split_path = src_path.with_name(
+                                    f"{src_path.stem}_split{src_path.suffix}"
+                                )
+                            else:
+                                split_path = src_path.with_name(
+                                    f"{src_path.name}_split.png"
+                                )
+                            self.save_path_split = str(split_path)
+                            self.save_path_split_is_custom = False
+                    defaults = _default_split_output_names(img) or {}
+                    if not getattr(self, "split_name_r_is_custom", False):
+                        self.split_name_r = defaults.get("r", self.split_name_r)
+                        self.split_name_r_is_custom = False
+                    if not getattr(self, "split_name_g_is_custom", False):
+                        self.split_name_g = defaults.get("g", self.split_name_g)
+                        self.split_name_g_is_custom = False
+                    if not getattr(self, "split_name_b_is_custom", False):
+                        self.split_name_b = defaults.get("b", self.split_name_b)
+                        self.split_name_b_is_custom = False
+                    if not getattr(self, "split_name_a_is_custom", False):
+                        self.split_name_a = defaults.get("a", self.split_name_a)
+                        self.split_name_a_is_custom = False
             except Exception:
                 pass
 
     return update
 
 
-def _default_save_path_for_image(image) -> str | None:
+def _default_save_path_for_image(image, *, suffix: str) -> str | None:
     if image is None:
         return None
     filepath = (
@@ -274,21 +434,61 @@ def _default_save_path_for_image(image) -> str | None:
     if not src_path.name:
         return None
     if src_path.suffix:
-        return str(src_path.with_name(f"{src_path.stem}_packed{src_path.suffix}"))
-    return str(src_path.with_name(f"{src_path.name}_packed.png"))
+        return str(src_path.with_name(f"{src_path.stem}_{suffix}{src_path.suffix}"))
+    return str(src_path.with_name(f"{src_path.name}_{suffix}.png"))
+
+
+def _default_split_output_names(image) -> dict[str, str] | None:
+    if image is None:
+        return None
+    filepath = (
+        getattr(image, "filepath_raw", "") or getattr(image, "filepath", "") or ""
+    ).strip()
+    if filepath:
+        src_path = Path(bpy.path.abspath(filepath))
+        base = src_path.stem or image.name
+    else:
+        base = image.name
+    base = (base or "Image").strip()
+    return {
+        "r": f"{base}_red",
+        "g": f"{base}_green",
+        "b": f"{base}_blue",
+        "a": f"{base}_alpha",
+    }
 
 
 def _ensure_default_save_paths(props) -> None:
     if not (getattr(props, "save_path_single", "") or "").strip() and props.rgb_image:
-        suggested = _default_save_path_for_image(props.rgb_image)
+        suggested = _default_save_path_for_image(props.rgb_image, suffix="packed")
         if suggested:
             props.save_path_single = suggested
             props.save_path_single_is_custom = False
     if not (getattr(props, "save_path_multi", "") or "").strip() and props.r_image:
-        suggested = _default_save_path_for_image(props.r_image)
+        suggested = _default_save_path_for_image(props.r_image, suffix="packed")
         if suggested:
             props.save_path_multi = suggested
             props.save_path_multi_is_custom = False
+    if not (getattr(props, "save_path_split", "") or "").strip() and props.split_image:
+        suggested = _default_save_path_for_image(props.split_image, suffix="split")
+        if suggested:
+            props.save_path_split = suggested
+            props.save_path_split_is_custom = False
+
+    if props.split_image:
+        defaults = _default_split_output_names(props.split_image) or {}
+        if not getattr(props, "split_name_r_is_custom", False):
+            props.split_name_r = defaults.get("r", props.split_name_r)
+            props.split_name_r_is_custom = False
+        if not getattr(props, "split_name_g_is_custom", False):
+            props.split_name_g = defaults.get("g", props.split_name_g)
+            props.split_name_g_is_custom = False
+        if not getattr(props, "split_name_b_is_custom", False):
+            props.split_name_b = defaults.get("b", props.split_name_b)
+            props.split_name_b_is_custom = False
+        if not getattr(props, "split_name_a_is_custom", False):
+            props.split_name_a = defaults.get("a", props.split_name_a)
+            props.split_name_a_is_custom = False
 
 
 # -----------------------------------------------------------------------------
@@ -304,8 +504,13 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
             ("SINGLE", "RGB + Alpha", "Pack one RGB image and one Alpha image"),
             (
                 "MULTI",
-                "Separate Channels",
+                "4-Channel (R+G+B+A)",
                 "Pack four separate channel images (R, G, B, A)",
+            ),
+            (
+                "SPLIT",
+                "Split Channels",
+                "Split a 3 or 4 channel image into separate channel images",
             ),
         ],
         default="SINGLE",
@@ -358,6 +563,61 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
         update=image_update_callback("a_image"),
     )
 
+    split_image: bpy.props.PointerProperty(
+        name="Split Source Image",
+        type=bpy.types.Image,
+        description="3 or 4 channel image to split into separate channel images",
+        update=image_update_callback("split_image"),
+    )
+    split_name_r: bpy.props.StringProperty(
+        name="Red",
+        description="Output image name for Red channel",
+        default="",
+        update=_mark_split_name_r_custom,
+    )
+    split_name_r_is_custom: bpy.props.BoolProperty(
+        name="Split Name R Is Custom",
+        description="Internal flag for split name (r)",
+        default=False,
+        options={"HIDDEN"},
+    )
+    split_name_g: bpy.props.StringProperty(
+        name="Green",
+        description="Output image name for Green channel",
+        default="",
+        update=_mark_split_name_g_custom,
+    )
+    split_name_g_is_custom: bpy.props.BoolProperty(
+        name="Split Name G Is Custom",
+        description="Internal flag for split name (g)",
+        default=False,
+        options={"HIDDEN"},
+    )
+    split_name_b: bpy.props.StringProperty(
+        name="Blue",
+        description="Output image name for Blue channel",
+        default="",
+        update=_mark_split_name_b_custom,
+    )
+    split_name_b_is_custom: bpy.props.BoolProperty(
+        name="Split Name B Is Custom",
+        description="Internal flag for split name (b)",
+        default=False,
+        options={"HIDDEN"},
+    )
+    split_name_a: bpy.props.StringProperty(
+        name="Alpha",
+        description="Output image name for Alpha channel",
+        default="",
+        update=_mark_split_name_a_custom,
+    )
+    split_name_a_is_custom: bpy.props.BoolProperty(
+        name="Split Name A Is Custom",
+        description="Internal flag for split name (a)",
+        default=False,
+        options={"HIDDEN"},
+    )
+
     # Storage for the resulting packed image.
     result_image: bpy.props.PointerProperty(
         name="Result Image",
@@ -402,6 +662,20 @@ class BeyondChannelPackerProperties(bpy.types.PropertyGroup):
     save_path_multi_is_custom: bpy.props.BoolProperty(
         name="Save Path Multi Is Custom",
         description="Internal flag for Save To (multi)",
+        default=False,
+        options={"HIDDEN"},
+    )
+
+    save_path_split: bpy.props.StringProperty(
+        name="Save To",
+        description="Base save target path for Split Channels",
+        subtype="FILE_PATH",
+        default="",
+        update=_mark_save_split_custom,
+    )
+    save_path_split_is_custom: bpy.props.BoolProperty(
+        name="Save Path Split Is Custom",
+        description="Internal flag for Save To (split)",
         default=False,
         options={"HIDDEN"},
     )
@@ -510,6 +784,50 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
                 _ = img.pixels[0]
             except Exception:
                 pass
+
+        missing_sources: list[str] = []
+        cached_missing: list[str] = []
+        for img in selected_images:
+            if img is None:
+                continue
+            abs_path = _image_abspath(img)
+            if not abs_path:
+                continue
+            try:
+                if getattr(img, "source", "") != "FILE":
+                    continue
+            except Exception:
+                continue
+            try:
+                exists = Path(abs_path).exists()
+            except Exception:
+                exists = True
+            if exists:
+                continue
+            try:
+                has_data = bool(getattr(img, "has_data", False))
+            except Exception:
+                has_data = False
+            try:
+                packed = bool(getattr(img, "packed_file", None))
+            except Exception:
+                packed = False
+            if packed:
+                continue
+            if has_data:
+                cached_missing.append(abs_path)
+            else:
+                missing_sources.append(abs_path)
+
+        if missing_sources:
+            self.report(
+                {"ERROR"},
+                "Source image(s) missing on disk. Reload or re-link and try again.",
+            )
+            props.debug_info = f"MISSING[{len(missing_sources)}]"
+            return {"CANCELLED"}
+        if cached_missing:
+            props.debug_info = f"MISSING_CACHED[{len(cached_missing)}]"
 
         # For SINGLE mode, the RGB image is required.
         if mode == "SINGLE":
@@ -907,215 +1225,445 @@ class ChannelPackerOTPackChannels(bpy.types.Operator):
             return "OK:foreach"
 
         # -------------------------------------------------------------------------
-        # Create a new image datablock for the packed result.
+        # Create/update the packed result image and save it.
         # -------------------------------------------------------------------------
-            source_for_colorspace = None
-            if mode == "SINGLE":
-                source_for_colorspace = props.rgb_image
-            else:
-                source_for_colorspace = (
-                    props.r_image
-                    or props.g_image
-                    or props.b_image
-                    or props.a_image
-                )
-
-            sources = (
-                [props.rgb_image, props.alpha_image]
-                if mode == "SINGLE"
-                else [props.r_image, props.g_image, props.b_image, props.a_image]
+        source_for_colorspace = None
+        if mode == "SINGLE":
+            source_for_colorspace = props.rgb_image
+        else:
+            source_for_colorspace = (
+                props.r_image
+                or props.g_image
+                or props.b_image
+                or props.a_image
             )
-            base_target = _autosave_target_for_sources(sources)
-            base_target_path = Path(bpy.path.abspath(base_target))
-            file_format, ext = _autosave_format_for_path(str(base_target_path))
-            wants_float = ext in {".exr", ".hdr"}
-            for src in sources:
-                if src is None:
-                    continue
-                if bool(getattr(src, "is_float", False)):
-                    wants_float = True
-                    break
-            if mode == "MULTI":
-                wants_float = True
 
-            base_img = None
-            if source_for_colorspace is not None:
+        sources = (
+            [props.rgb_image, props.alpha_image]
+            if mode == "SINGLE"
+            else [props.r_image, props.g_image, props.b_image, props.a_image]
+        )
+        override_existing = bool(props.override_img_if_exists)
+        base_path = (
+            props.save_path_single if mode == "SINGLE" else props.save_path_multi
+        )
+        out_path, file_format = _resolve_save_target_path(
+            base_path=base_path,
+            sources=sources,
+            override_existing=override_existing,
+        )
+
+        base_target = (base_path or "").strip()
+        if not base_target:
+            base_target = _autosave_packed_target_for_sources(sources)
+        base_target_path = Path(bpy.path.abspath(base_target))
+        if not base_target_path.suffix:
+            base_target_path = base_target_path.with_suffix(out_path.suffix)
+        base_name = _result_image_base_name(mode=mode, base_stem=base_target_path.stem)
+
+        ext = out_path.suffix.lower()
+        wants_float = ext in {".exr", ".hdr"}
+        for src in sources:
+            if src is None:
+                continue
+            if bool(getattr(src, "is_float", False)):
+                wants_float = True
+                break
+
+        base_img = context.blend_data.images.get(base_name)
+        if base_img is None and mode == "MULTI":
+            base_img = _find_image_by_abspath(context.blend_data, str(out_path))
+
+        if base_img is None and mode == "MULTI":
+            if out_path.exists():
                 try:
-                    base_img = source_for_colorspace.copy()
+                    base_img = context.blend_data.images.load(
+                        str(out_path),
+                        check_existing=True,
+                    )
                 except Exception:
                     base_img = None
 
+        if base_img is None:
             if mode == "MULTI":
-                base_img = None
-
-                def _make_multi_file_backed_base():
-                    for src in sources:
-                        if src is None:
-                            continue
-                        filepath = (
-                            getattr(src, "filepath_raw", "")
-                            or getattr(src, "filepath", "")
-                            or ""
-                        ).strip()
-                        if not filepath:
-                            continue
-                        filepath_abs = bpy.path.abspath(filepath)
-                        if not filepath_abs:
-                            continue
-                        try:
-                            img = context.blend_data.images.load(
-                                filepath_abs,
-                                check_existing=False,
-                            )
-                        except Exception:
-                            continue
-                        return img
-                    return None
-
-                base_img = _make_multi_file_backed_base()
-
-                if base_img is None and target_img is not None:
+                for src in sources:
+                    fp = _image_abspath(src)
+                    if not fp:
+                        continue
                     try:
-                        base_img = target_img.copy()
+                        base_img = context.blend_data.images.load(
+                            fp,
+                            check_existing=False,
+                        )
                     except Exception:
                         base_img = None
+                    if base_img is None:
+                        continue
+                    try:
+                        base_img.name = base_name
+                    except Exception:
+                        pass
+                    try:
+                        base_img.filepath_raw = str(out_path)
+                    except Exception:
+                        pass
+                    break
 
-            if base_img is not None:
-                try:
-                    _ = base_img.pixels[0]
-                except Exception:
-                    pass
-                try:
-                    base_img.name = _unique_image_name(
-                        context.blend_data,
-                        "ChannelPacked",
-                    )
-                except Exception:
-                    pass
-                try:
-                    base_img.use_fake_user = False
-                except Exception:
-                    pass
-                if int(base_img.size[0]) != width or int(base_img.size[1]) != height:
-                    if mode == "MULTI" and getattr(base_img, "source", "") != "FILE":
+        if base_img is None:
+            result_img = context.blend_data.images.new(
+                name=_unique_image_name(context.blend_data, base_name),
+                width=width,
+                height=height,
+                alpha=True,
+                float_buffer=wants_float,
+            )
+        else:
+            result_img = base_img
+
+        try:
+            result_img.name = base_name
+        except Exception:
+            pass
+        try:
+            result_img.use_fake_user = False
+        except Exception:
+            pass
+        if int(result_img.size[0]) != width or int(result_img.size[1]) != height:
+            try:
+                if getattr(result_img, "source", "") == "FILE" and not getattr(
+                    result_img,
+                    "has_data",
+                    True,
+                ):
+                    fallback = None
+                    for src in sources:
+                        fp = _image_abspath(src)
+                        if not fp:
+                            continue
                         try:
-                            context.blend_data.images.remove(base_img, do_unlink=True)
+                            if Path(fp).exists():
+                                fallback = fp
+                                break
+                        except Exception:
+                            fallback = fp
+                            break
+                    if fallback:
+                        try:
+                            result_img.filepath_raw = fallback
+                        except Exception:
+                            fallback = None
+                    if fallback:
+                        try:
+                            result_img.reload()
                         except Exception:
                             pass
-                        base_img = None
-                    else:
-                        ensure_image_pixels_loaded(base_img)
-                        try:
-                            base_img.scale(width, height)
-                        except Exception as exc:
-                            self.report(
-                                {"ERROR"},
-                                f"Could not scale base image '{base_img.name}': {exc}",
-                            )
-                            return {"CANCELLED"}
-            if base_img is None:
-                result_img = context.blend_data.images.new(
-                    name=_unique_image_name(context.blend_data, "ChannelPacked"),
-                    width=width,
-                    height=height,
-                    alpha=True,
-                    float_buffer=wants_float,
-                )
-            else:
-                result_img = base_img
-
-            try:
-                result_img.use_view_as_render = False
             except Exception:
                 pass
+            ensure_image_pixels_loaded(result_img)
             try:
-                result_img.alpha_mode = "STRAIGHT"
-            except (AttributeError, TypeError):
-                pass
-            try:
-                if mode == "MULTI":
-                    result_img.alpha_mode = "STRAIGHT"
-            except Exception:
-                pass
-            if source_for_colorspace is not None:
-                try:
-                    result_img.colorspace_settings.name = (
-                        source_for_colorspace.colorspace_settings.name
-                    )
-                except (AttributeError, TypeError):
-                    pass
-
-            set_status = assign_pixels(result_img, flat_pixels)
-            props.result_image = result_img
-
-            rb = _readback_minmax(props.result_image)
-            try:
-                alpha_mode_dbg = props.result_image.alpha_mode
-            except Exception:
-                alpha_mode_dbg = "?"
-            try:
-                px_len_dbg = len(props.result_image.pixels)
-            except Exception:
-                px_len_dbg = -1
-            try:
-                is_float_dbg = bool(getattr(props.result_image, "is_float", False))
-            except Exception:
-                is_float_dbg = False
-            buf_dbg = f"BUF[len={px_len_dbg},float={is_float_dbg}]"
-            if rb is not None:
-                rb_mins, rb_maxs = rb
-                props.debug_info = (
-                    f"{props.debug_info} OUT[{out_mins},{out_maxs}] "
-                    f"WRITE[{rb_mins},{rb_maxs}] SET[{set_status}] {buf_dbg}"
-                ).strip()
-            else:
-                props.debug_info = (
-                    f"{props.debug_info} OUT[{out_mins},{out_maxs}] "
-                    f"WRITE[?] SET[{set_status}] {buf_dbg}"
-                ).strip()
-            props.debug_info = (
-                f"{props.debug_info} AM[{alpha_mode_dbg}]"
-            ).strip()
-
-            sources = (
-                [props.rgb_image, props.alpha_image]
-                if mode == "SINGLE"
-                else [props.r_image, props.g_image, props.b_image, props.a_image]
-            )
-            override_existing = bool(props.override_img_if_exists)
-            base_path = (
-                props.save_path_single if mode == "SINGLE" else props.save_path_multi
-            )
-            out_path, file_format = _resolve_save_target_path(
-                base_path=base_path,
-                sources=sources,
-                override_existing=override_existing,
-            )
-
-            props.result_image.filepath_raw = str(out_path)
-            try:
-                props.result_image.file_format = file_format
-            except (AttributeError, TypeError):
-                pass
-            try:
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                props.result_image.save()
-                props.last_saved_path = str(out_path)
-            except RuntimeError as exc:
+                result_img.scale(width, height)
+            except Exception as exc:
                 self.report(
-                    {"WARNING"},
-                    f"Packed, but could not auto-save result: {exc}",
+                    {"ERROR"},
+                    f"Could not scale result image '{result_img.name}': {exc}",
                 )
+                return {"CANCELLED"}
+
+        try:
+            result_img.use_view_as_render = False
+        except Exception:
+            pass
+        try:
+            result_img.alpha_mode = "STRAIGHT"
+        except Exception:
+            pass
+        if source_for_colorspace is not None:
+            try:
+                result_img.colorspace_settings.name = (
+                    source_for_colorspace.colorspace_settings.name
+                )
+            except Exception:
+                pass
+
+        set_status = assign_pixels(result_img, flat_pixels)
+        props.result_image = result_img
+        try:
+            props.result_image.update()
+        except Exception:
+            pass
+
+        rb = _readback_minmax(props.result_image)
+        try:
+            alpha_mode_dbg = props.result_image.alpha_mode
+        except Exception:
+            alpha_mode_dbg = "?"
+        try:
+            px_len_dbg = len(props.result_image.pixels)
+        except Exception:
+            px_len_dbg = -1
+        try:
+            is_float_dbg = bool(getattr(props.result_image, "is_float", False))
+        except Exception:
+            is_float_dbg = False
+        buf_dbg = f"BUF[len={px_len_dbg},float={is_float_dbg}]"
+        if rb is not None:
+            rb_mins, rb_maxs = rb
+            props.debug_info = (
+                f"{props.debug_info} OUT[{out_mins},{out_maxs}] "
+                f"WRITE[{rb_mins},{rb_maxs}] SET[{set_status}] {buf_dbg}"
+            ).strip()
+        else:
+            props.debug_info = (
+                f"{props.debug_info} OUT[{out_mins},{out_maxs}] "
+                f"WRITE[?] SET[{set_status}] {buf_dbg}"
+            ).strip()
+        props.debug_info = f"{props.debug_info} AM[{alpha_mode_dbg}]".strip()
+
+        props.result_image.filepath_raw = str(out_path)
+        try:
+            props.result_image.file_format = file_format
+        except Exception:
+            pass
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            props.result_image.save()
+            if not out_path.exists():
+                raise RuntimeError("File was not written to disk.")
+            props.last_saved_path = str(out_path)
+        except RuntimeError as exc:
+            self.report({"ERROR"}, f"Packed, but could not save result: {exc}")
+            return {"CANCELLED"}
 
         _set_active_image_in_image_editor(context, props.result_image)
 
-        if props.last_saved_path:
-            self.report(
-                {"INFO"},
-                f"Channel packing complete. Saved: {props.last_saved_path}",
+        if not (props.last_saved_path or "").strip():
+            self.report({"ERROR"}, "Packing finished, but did not save to disk.")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"Channel packing complete. Saved: {props.last_saved_path}",
+        )
+        return {"FINISHED"}
+
+
+# -----------------------------------------------------------------------------
+# Operator: Split Channels
+# -----------------------------------------------------------------------------
+class ChannelPackerOTSplitChannels(bpy.types.Operator):
+    """Split a 3 or 4 channel image into separate channel images"""
+
+    bl_idname = "channelpacker.split_channels"
+    bl_label = "Split Channels"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        props = context.scene.beyond_channel_packer
+        props.last_saved_path = ""
+        props.debug_info = ""
+        _ensure_default_save_paths(props)
+
+        src_img = props.split_image
+        if src_img is None:
+            self.report({"ERROR"}, "Split Source Image is required.")
+            return {"CANCELLED"}
+
+        try:
+            import numpy as np  # type: ignore
+        except ModuleNotFoundError:
+            self.report({"ERROR"}, "NumPy is required for splitting in this version.")
+            return {"CANCELLED"}
+
+        try:
+            if getattr(src_img, "source", "") == "FILE" and not getattr(
+                src_img, "has_data", True
+            ):
+                src_img.reload()
+        except Exception:
+            pass
+        try:
+            _ = src_img.pixels[0]
+        except Exception:
+            pass
+
+        width, height = int(src_img.size[0]), int(src_img.size[1])
+        if width <= 0 or height <= 0:
+            self.report({"ERROR"}, "Split Source Image has invalid dimensions.")
+            return {"CANCELLED"}
+
+        try:
+            px_len = len(src_img.pixels)
+        except Exception:
+            px_len = 0
+        if px_len <= 0:
+            self.report({"ERROR"}, "Split Source Image has no pixel data.")
+            return {"CANCELLED"}
+
+        flat = np.empty(px_len, dtype=np.float32)
+        try:
+            src_img.pixels.foreach_get(flat)
+        except Exception:
+            try:
+                flat = np.array(src_img.pixels[:], dtype=np.float32)
+            except Exception:
+                self.report({"ERROR"}, "Could not read Split Source Image pixels.")
+                return {"CANCELLED"}
+
+        denom = width * height
+        if denom <= 0 or (flat.size % denom) != 0:
+            self.report({"ERROR"}, "Split Source Image pixel buffer mismatch.")
+            return {"CANCELLED"}
+
+        channels = int(flat.size // denom)
+        if channels < 3:
+            self.report({"ERROR"}, "Split Source Image must have 3 or 4 channels.")
+            return {"CANCELLED"}
+
+        arr = flat.reshape((height, width, channels))
+        r = arr[:, :, 0]
+        g = arr[:, :, 1]
+        b = arr[:, :, 2]
+        a = arr[:, :, 3] if channels >= 4 else None
+
+        base = (props.save_path_split or "").strip()
+        base_target = base
+        if not base_target:
+            base_target = (
+                _default_save_path_for_image(src_img, suffix="split")
+                or _autosave_target_for_sources([src_img])
             )
-        else:
-            self.report({"INFO"}, "Channel packing complete.")
+        base_path = Path(bpy.path.abspath(base_target))
+        file_format, ext = _autosave_format_for_path(str(base_path))
+        if base_path.suffix:
+            detected = _image_file_format_from_path(str(base_path))
+            if detected is not None:
+                file_format = detected
+                ext = base_path.suffix
+        if not base_path.suffix:
+            base_path = base_path.with_suffix(ext)
+
+        wants_float = ext.lower() in {".exr", ".hdr"} or bool(
+            getattr(src_img, "is_float", False)
+        )
+        override_existing = bool(props.override_img_if_exists)
+
+        def _clean_stem(value: str, fallback: str) -> str:
+            stem = (value or "").strip()
+            if not stem:
+                return fallback
+            parsed = Path(stem)
+            if parsed.suffix:
+                return parsed.stem or fallback
+            return stem
+
+        base_dir = base_path.parent if str(base_path.parent) else Path(".")
+        base_stem = base_path.stem or (src_img.name or "Image")
+        defaults = _default_split_output_names(src_img) or {}
+        name_r = _clean_stem(props.split_name_r, defaults.get("r", f"{base_stem}_red"))
+        name_g = _clean_stem(
+            props.split_name_g,
+            defaults.get("g", f"{base_stem}_green"),
+        )
+        name_b = _clean_stem(props.split_name_b, defaults.get("b", f"{base_stem}_blue"))
+        name_a = _clean_stem(
+            props.split_name_a,
+            defaults.get("a", f"{base_stem}_alpha"),
+        )
+
+        channel_defs = [(name_r, r), (name_g, g), (name_b, b)]
+        if a is not None:
+            channel_defs.append((name_a, a))
+
+        saved_paths: list[Path] = []
+        preview_img = None
+        try:
+            for stem, channel_data in channel_defs:
+                out_path = base_dir / f"{stem}{ext}"
+                if not override_existing:
+                    out_path = _unique_path(out_path)
+
+                out_abs = str(out_path)
+                out_img = context.blend_data.images.get(stem)
+                if out_img is None:
+                    out_img = _find_image_by_abspath(context.blend_data, out_abs)
+                if out_img is None:
+                    out_img = context.blend_data.images.new(
+                        name=stem,
+                        width=width,
+                        height=height,
+                        alpha=True,
+                        float_buffer=wants_float,
+                    )
+                else:
+                    _ensure_pixels_loaded(out_img)
+                    try:
+                        out_img.name = stem
+                    except Exception:
+                        pass
+                    if int(out_img.size[0]) != width or int(out_img.size[1]) != height:
+                        try:
+                            out_img.scale(width, height)
+                        except Exception:
+                            pass
+                if preview_img is None:
+                    preview_img = out_img
+
+                try:
+                    out_img.use_view_as_render = False
+                except Exception:
+                    pass
+                try:
+                    out_img.alpha_mode = "STRAIGHT"
+                except Exception:
+                    pass
+                try:
+                    out_img.colorspace_settings.name = "Non-Color"
+                except Exception:
+                    pass
+
+                vals = channel_data.astype(np.float32, copy=False).reshape(-1)
+                out_px = np.empty(vals.size * 4, dtype=np.float32)
+                out_px[0::4] = vals
+                out_px[1::4] = vals
+                out_px[2::4] = vals
+                out_px[3::4] = 1.0
+
+                try:
+                    out_img.pixels.foreach_set(out_px)
+                except Exception:
+                    out_img.pixels[:] = out_px.tolist()
+                try:
+                    out_img.update()
+                except Exception:
+                    pass
+
+                out_img.filepath_raw = str(out_path)
+                try:
+                    out_img.file_format = file_format
+                except Exception:
+                    pass
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                out_img.save(
+                    filepath=str(out_path),
+                    save_copy=not override_existing,
+                )
+                saved_paths.append(out_path)
+
+            if preview_img is not None:
+                props.result_image = preview_img
+            if saved_paths:
+                props.last_saved_path = str(saved_paths[-1])
+
+            props.debug_info = (
+                f"SPLIT[{channels}] OUT[{width}x{height}] "
+                f"SAVED[{len(saved_paths)}] BASE[{base_path}]"
+            )
+        except RuntimeError as exc:
+            self.report({"ERROR"}, f"Could not save split channels: {exc}")
+            return {"CANCELLED"}
+
+        if props.result_image is not None:
+            _set_active_image_in_image_editor(context, props.result_image)
+        self.report({"INFO"}, f"Split complete. Saved {len(saved_paths)} image(s).")
         return {"FINISHED"}
 
 
@@ -1148,6 +1696,7 @@ class ChannelPackerOTLoadImage(bpy.types.Operator):
             "g_image",
             "b_image",
             "a_image",
+            "split_image",
         }
         if self.target_prop not in allowed:
             self.report({"ERROR"}, "Invalid target image slot.")
@@ -1209,7 +1758,8 @@ class ChannelPackerPTPanel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         props = context.scene.beyond_channel_packer
-        _schedule_default_save_paths(context.scene)
+        if _needs_default_save_paths(props):
+            _schedule_default_save_paths(context.scene)
 
         def draw_slot(parent, prop_name: str, label: str, label_factor: float):
             slot = parent.box()
@@ -1237,7 +1787,7 @@ class ChannelPackerPTPanel(bpy.types.Panel):
         if props.mode == "SINGLE":
             draw_slot(sources_box, "rgb_image", "RGB", 0.32)
             draw_slot(sources_box, "alpha_image", "Alpha (Optional)", 0.32)
-        else:
+        elif props.mode == "MULTI":
             grid = sources_box.grid_flow(
                 columns=2, even_columns=True, even_rows=False, align=True
             )
@@ -1245,6 +1795,8 @@ class ChannelPackerPTPanel(bpy.types.Panel):
             draw_slot(grid, "g_image", "Green", 0.22)
             draw_slot(grid, "b_image", "Blue", 0.22)
             draw_slot(grid, "a_image", "Alpha", 0.22)
+        else:
+            draw_slot(sources_box, "split_image", "Source", 0.32)
 
         layout.separator()
         layout.separator()
@@ -1254,27 +1806,45 @@ class ChannelPackerPTPanel(bpy.types.Panel):
         save_row = result_box.row(align=True)
         if props.mode == "SINGLE":
             save_row.prop(props, "save_path_single", text="Save To")
-        else:
+        elif props.mode == "MULTI":
             save_row.prop(props, "save_path_multi", text="Save To")
-        result_box.operator("channelpacker.pack_channels", icon="FILE_BLEND")
+        else:
+            save_row.prop(props, "save_path_split", text="Save To")
+            names_box = result_box.box()
+            names_box.label(text="Output Names")
+            has_alpha = False
+            if props.split_image is not None:
+                try:
+                    ch = int(getattr(props.split_image, "channels", 0) or 0)
+                except Exception:
+                    ch = 0
+                if ch == 3:
+                    has_alpha = False
+                else:
+                    has_alpha = True
+            grid = names_box.grid_flow(
+                columns=2,
+                even_columns=True,
+                even_rows=False,
+                align=True,
+            )
+            grid.prop(props, "split_name_r")
+            grid.prop(props, "split_name_g")
+            grid.prop(props, "split_name_b")
+            if has_alpha:
+                grid.prop(props, "split_name_a")
+
+        if props.mode == "SPLIT":
+            result_box.operator("channelpacker.split_channels", icon="FILE_BLEND")
+        else:
+            result_box.operator("channelpacker.pack_channels", icon="FILE_BLEND")
         result_box.prop(
             props,
             "override_img_if_exists",
             text="Override Img if Exists",
         )
 
-        if props.result_image:
-            try:
-                props.result_image.preview_ensure()
-                icon_id = props.result_image.preview.icon_id
-                if icon_id:
-                    result_box.template_icon(icon_value=icon_id, scale=8.0)
-                else:
-                    result_box.label(text=props.result_image.name)
-            except Exception:
-                result_box.label(text=props.result_image.name)
-        else:
-            result_box.label(text="No packed result yet.")
+        # Result is shown by setting the active Image Editor image.
 
         layout.separator()
         layout.separator()
@@ -1322,6 +1892,7 @@ class ChannelPackerPTPanel(bpy.types.Panel):
 classes = (
     BeyondChannelPackerProperties,
     ChannelPackerOTPackChannels,
+    ChannelPackerOTSplitChannels,
     ChannelPackerOTLoadImage,
     ChannelPackerOTCopyDebug,
     ChannelPackerOTCopySavedPath,
