@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "beyond_channel_packer"
-version = "1.0.1"
+version = "1.0.2"
 name = "Beyond Channel Packer"
 tagline = "Pack image channels (RGBA) in the Image Editor"
 maintainer = "Beyond Dev (Tyler Walker)"
